@@ -1,0 +1,341 @@
+#!/bin/csh -f
+#
+# fcszero { new | match }
+#
+# Script to rotate DEIMOS to a PA that corresponds to the center of the
+# flexure range for the currently selected slider.  If invoked with no
+# arguments or with the 'new' argument, it will also reset the tent mirror,
+# dewar X translation stage, and any applicable tilt offsets to the center
+# of their respective ranges.  If invoked with the 'match' argument, only
+# the PA will be adjusted.
+#
+# Version 2.1 - 13 May 2003
+#
+# Command invocation is:
+#
+# fcszero { new | match }
+#
+
+if( $#argv == 1 ) then
+  if( ($argv[1] != "new") && ($argv[1] != "match")) then
+    set message = "Usage: fcszero { new | match }"
+    echo $message
+    set fcserr  = -400
+    goto abort
+  endif
+  set mode = $argv[1]
+else if( $#argv == 0 ) then
+  set mode = "new"
+else
+  set message = "Usage: fcszero { new | match }"
+  echo $message
+  set fcserr  = -400
+  goto abort
+endif
+
+echo fcszero version 2.1 will operate with mode = $mode
+
+# Can't zero the FCS unless the FCS state is idle
+
+set fcsstate=`show -s deifcs -terse fcsstate`
+if( $status ) then
+  set local_status = $status
+  echo "Error $local_status reading FCS mode"
+  set message = "fcszero got error $local_status when trying to read FCS state"
+  set fcserr  = -200
+  goto abort
+endif
+
+if( "$fcsstate" != "idle" ) then
+  echo "Can't zero FCS because FCS is not in idle state"
+  set message = \
+    "fcszero cannot configure for reference images because FCS is not idle"
+  set fcserr  = -220
+  goto abort
+endif
+set gratepos=`show -s deimot -terse gratepos`
+if( $status ) then
+  set local_status = $status
+  echo "error $local_status reading grating position"
+  set message = \
+    "fcszero command got error $local_status when reading grating position"
+  set fcserr  = -201    
+  goto abort
+endif
+
+echo
+echo slider $gratepos is clamped in position
+
+set message = "fcszero about to configure DEIMOS for $mode reference image"
+set fcserr  = 0
+modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+# Give users time to see this message
+  sleep 1
+
+set rotatval = `show -s deirot -terse rotatval`
+if( $status ) then
+  set local_status = $status
+  echo "error $local_status reading DEIMOS position angle"
+  set message = \
+  "fcszero command got error $local_status when reading DEIMOS position angle" 
+  set fcserr  = -202    
+  goto abort
+endif
+
+# Get integer value of PA for threshold test
+set pa = `echo $rotatval | /usr/bin/sed "s/\./ /"`
+set pa = $pa[1]
+
+set rotatlck=`show -s deirot -terse rotatlck`
+if( $status ) then
+  set local_status = $status
+  echo "error $local_status reading DEIMOS rotation lock status"
+  set message = \
+    "fcszero command got error $local_status when reading rotation lock state"
+  set fcserr  = -203    
+  goto abort
+endif
+
+if( $rotatlck[1] != "UNLOCKED" ) then
+  echo "warning: DEIMOS rotation system is locked"
+  set message = \
+    "fcszero command detected that DEIMOS rotation system is locked"
+  set fcserr  = -204    
+  modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+endif
+
+modify -s deirot rotatmod=pos
+if( $status ) then
+  set local_status = $status
+  echo "error $local_status setting DEIMOS rotation mode to pos"
+  set message = \
+ "fcszero command got error $local_status when setting rotator to position mode"
+  set fcserr  = -205    
+  goto abort
+endif
+
+if ( $gratepos == 2 ) then
+  if( ($pa != -5) && ($pa != -365) ) then
+     echo "DEIMOS PA of $pa is not centered on flexure curve for slider 2"
+     if( $rotatlck[1] != "UNLOCKED" ) then
+	echo "Unable to rotate DEIMOS because rotation is locked"
+        set message = \
+         "fcszero command unable to rotate DEIMOS due to rotator lock"
+        set fcserr  = -206
+        goto abort
+     else
+	set message = \
+		"About to rotate DEIMOS to PA -5, slider 2 center of flexure"
+	echo "$message"
+	modify -s deifcs nowait fcsmsg="$message"
+
+	modify -s deirot rotatval=-5.0
+	if( $status ) then
+            set local_status = $status
+  	    echo "error $local_status rotating DEIMOS to PA -5"
+            set message = \
+              "fcszero command got error $local_status when rotating to PA -5"
+            set fcserr  = -207
+	    goto abort
+	endif
+     endif
+  else
+     echo "DEIMOS is already at PA -5, slider 2 center of flexure"
+  endif
+else if ( $gratepos == 3 ) then
+  if( ($pa != -30) && ($pa != -390) ) then
+     echo "DEIMOS PA of $pa is not centered on flexure curve for slider 3"
+     if( $rotatlck[1] != "UNLOCKED" ) then
+	echo "Unable to rotate DEIMOS because rotation is locked"
+        set message = \
+         "fcszero command unable to rotate DEIMOS due to rotator lock"
+        set fcserr  = -208
+        goto abort
+     else
+	set message = \
+		"About to rotate DEIMOS to PA -30, slider 3 center of flexure"
+	echo "$message"
+	modify -s deifcs nowait fcsmsg="$message"
+	modify -s deirot rotatval=-30.0
+	if( $status ) then
+            set local_status = $status
+  	    echo "error $local_status rotating DEIMOS to PA -30"
+            set message = \
+              "fcszero command got error $local_status when rotating to PA -30"
+            set fcserr  = -209
+	    goto abort
+	endif
+     endif
+  else
+     echo "DEIMOS is already at PA -30, slider 3 center of flexure"
+  endif
+  if( $mode == "new" ) then
+    set g3tltoff = `show -s deimot -terse g3tltoff`
+    if( $status ) then
+      set local_status = $status
+      echo "error $local_status reading slider 3 tilt offset"
+      set message = \
+     "fcszero command got error $local_status when reading slider 3 tilt offset"
+      set fcserr  = -210
+      goto abort
+    endif
+    if( $g3tltoff ) then
+      echo "DEIMOS slider 3 tilt offset $g3tltoff is not centered in its range"
+      set message = "About to re-center the slider 3 tilt by setting offset=0"
+      echo "$message"
+      modify -s deifcs nowait fcsmsg="$message"
+      modify -s deimot g3tltoff=0
+      if( $status ) then
+        set local_status = $status
+        echo "error $local_status recentering slider 3 tilt offset
+        set message = \
+    "fcszero command got error $local_status when zeroing slider 3 tilt offset"
+        set fcserr  = -211
+        goto abort
+      endif
+    else
+     echo "slider 3 tilt offset is already centered in its range"
+    endif
+  endif
+else if ( $gratepos == 4 ) then
+  if( ($pa != -30) && ($pa != -390) ) then
+     echo "DEIMOS PA of $pa is not centered on flexure curve for slider 4"
+     if( $rotatlck[1] != "UNLOCKED" ) then
+	echo "Unable to rotate DEIMOS because rotation is locked"
+        set message = \
+         "fcszero command unable to rotate DEIMOS due to rotator lock"
+        set fcserr  = -208
+        goto abort
+     else
+	set message = \
+		"About to rotate DEIMOS to PA -30, slider 4 center of flexure"
+	echo "$message"
+	modify -s deifcs nowait fcsmsg="$message"
+	modify -s deirot rotatval=-30.0
+	if( $status ) then
+            set local_status = $status
+  	    echo "error rotating DEIMOS to PA -30"
+            set message = \
+              "fcszero command got error $local_status when rotating to PA -30"
+            set fcserr  = -209
+	    goto abort
+	endif
+     endif
+  else
+     echo "DEIMOS is already at PA -30, slider 4 center of flexure"
+  endif
+  if( $mode == "new" ) then
+    set g4tltoff = `show -s deimot -terse g4tltoff`
+    if( $status ) then
+      set local_status = $status
+      echo "error reading slider 4 tilt offset"
+      set message = \
+     "fcszero command got error $local_status when reading slider 4 tilt offset"
+      set fcserr  = -212
+      goto abort
+    endif
+    if( $g4tltoff ) then
+      echo "DEIMOS slider 4 tilt offset $g4tltoff is not centered in its range"
+      set message = "About to re-center the slider 4 tilt by setting offset=0"
+      echo "$message"
+      modify -s deifcs nowait fcsmsg="$message"
+      modify -s deimot g4tltoff=0
+      if( $status ) then
+        set local_status = $status
+        echo "error recentering slider 4 tilt offset
+        set message = \
+     "fcszero command got error $local_status when zeroing slider 4 tilt offset"
+        set fcserr  = -213
+        goto abort
+      endif
+    else
+      echo "slider 4 tilt offset is already centered in its range"
+    endif
+  endif
+else
+  echo "No slider is currently clamped down"
+  echo "You must have a slider selected before the FCS can be zeroed"
+  set message = "No slider clamped in place, so FCS cannot be zeroed"
+  set fcserr  = -214
+  goto abort
+endif
+
+set tmirrval = `show -s deimot -terse tmirrval`
+if( $status ) then
+  set local_status = $status
+  echo "error reading DEIMOS tent mirror position"
+  set message = \
+    "fcszero command got error $local_status when reading tent mirror position"
+  set fcserr  = -215    
+  goto abort
+endif
+
+if( $mode == "new" ) then
+  # Get integer value of tent mirror position for threshold test
+  set tmirr = `echo $tmirrval | /usr/bin/sed "s/\./ /"`
+  set tmirr = $tmirr[1]
+
+  if( $tmirr != 45 ) then
+    echo "DEIMOS tent mirror position of $tmirrval is not centered in its range"
+    set message = "Re-centering the tent mirror"
+    echo "$message"
+    modify -s deifcs nowait fcsmsg="$message"
+    modify -s deimot tmirrval=45.0
+    if( $status ) then
+      set local_status = $status
+      echo "error re-centering the DEIMOS tent mirror position"
+      set message = \
+      "fcszero command got error $local_status when re-centering tent mirror"
+      set fcserr  = -216    
+      goto abort
+    endif
+  else
+    echo "DEIMOS tent mirror position is already centered in its range"
+  endif
+
+  set dwxl8raw = `show -s deimot -terse dwxl8raw`
+  if( $status ) then
+    set local_status = $status
+    echo "error reading DEIMOS X translation stage position"
+    set message = \
+    "fcszero command got error $local_status when reading dewar X translation"
+    set fcserr  = -217    
+    goto abort
+  endif
+
+  # Get integer value of DEIMOS X translation stage position for threshold test
+  set dwxl8 = `echo $dwxl8raw | /usr/bin/sed "s/\./ /"`
+  set dwxl8 = $dwxl8[1]
+
+  if( ($dwxl8 < -755) || ($dwxl8 > -745) ) then
+    echo \
+      "DEIMOS X translation stage value $dwxl8raw is not centered in its range"
+    set message = "Re-centering the dewar translate stage"
+    echo "$message"
+    modify -s deifcs nowait fcsmsg="$message"
+    modify -s deimot dwxl8raw=-750
+    if( $status ) then
+      set local_status = $status
+      echo "error re-centering the DEIMOS X translation stage"
+      set message = \
+    "fcszero command got error $local_status when recentering dewar translation"
+      set fcserr  = -218    
+      goto abort
+    endif
+  else
+    echo "DEIMOS dewar translation stage is already centered in its range"
+  endif
+endif
+
+echo "fcszero $mode successful. You are now ready to take reference spots"
+set message = \
+    "fcszero $mode successful. You are now ready to take reference images"
+set fcserr  = 0
+modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+exit 0
+
+abort:
+echo "fcszero aborting"
+echo messsage is $message and fcserr is $fcserr
+modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+exit 1

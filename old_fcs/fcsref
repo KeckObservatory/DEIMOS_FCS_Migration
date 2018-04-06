@@ -1,0 +1,579 @@
+#!/bin/csh -f
+#
+# fcsref
+#
+# Script to capture the relevant configuration parameters of DEIMOS for the
+# FCS reference image obtained for the reference state of the current
+# instrument configuration.
+#
+# To obtain an FCS reference image for a given instrument configuration,
+# the observer should perform the following steps:
+#
+# 1. Configure DEIMOS for a particular observational setup (i.e., select
+#    grating or mirror, set grating tilt, select filter, adjust focus)
+# 
+# 2. Run the 'fcszero' script to rotate DEIMOS to the reference PA (i.e.,
+#    the PA that corresponds to the center of the flexure curve for this
+#    configuration) and drive the tent mirror, dewar translate, and
+#    appropriate grating stage to their respective central positions.
+#    Note that the obsever must have control of the DEIMOS rotator
+#    (i.e., ROTATDCS=false), the rotator must be in postion mode (i.e.,
+#    ROTATMOD=pos), and the rotator must be unlocked (ROTATLCK=unlocked).
+#
+# 3. Take one or more FCS images (adjusting FCS integration time) until
+#    a usable FCS image is obtained.  That image should be saved to disk
+#    (i.e., set DISK WRITE ENABLED on the FCS xpose GUI or set the
+#    FCS keyword TODISK equal to 1.
+#
+# 4. Invoke the "fcsref" script. fcsref can be invoked in one of three modes:
+#
+#   1. spotless
+#   2. multi-spot
+#   3. single-spot (for backward compatibility with original FCS system)
+#
+#############################################################################
+#
+# Spotless mode (default)
+#
+# For this mode, fcsref is invoked without any arguments, i.e.:
+#
+#	fcsref
+#
+# and no additional user input is needed.  In this mode, no reference spots
+# are defined for the reference image.  Rather, the FCS control loop (i.e.,
+# 'fcstrack') will track image # motion by cross-correlating the current
+# FCS image with its respective reference image.
+#
+#############################################################################
+# 
+# Multi-spot mode
+#
+# This mode is intended primarily for engineering use, e.g., for measuring
+# differential flexure between the various FCS fibers and for verifying that
+# the cross-correlation routines are functioning correctly.
+#
+# For this mode, fcsref is invoked with a single argument which gives
+# the count of the number (from 0 to 9) of reference spots to be defined
+# for this reference image, i.e.,
+#
+# 	fcsref	N	(where N = 0 to 9)
+#
+# (Note that specifying N = 0 is effectively the same as "spotless" mode,
+# but specifying N = 1 is not identical to "single-spot" mode; see section
+# on reference file naming conventions below.)
+#
+# For each spot, fcsref will then prompt you to enter the figdisp (X,Y)
+# coordinates (as obtained using the STATS BOX function) of the centroid
+# for that spot along with the value of the peak pixel for that spot.
+#
+# Centroid coordinates should be specified to a precision of 0.1 pixel.
+# Fcsref will not accept reference spots that are within 30 pixels of any
+# edge of either FCS CCD or whose peak pixel value is less than 1800 DN.
+# References spots can be located on either FCS CCD 1 or FCS CCD 2, or a
+# combination of the two.
+#
+# In this mode, the FCS control loop (i.e., 'fcstrack') will perform a
+# cross-correlation of the current FCS image with the respective
+# FCS reference image for the purposes of offsetting the centroiding
+# boxes for each reference spot in the current image.  In this manner,
+# the centroiding boxes will always track their respective spots, thus
+# avoiding the problem of FCS losing lock on the reference spots.
+# 'fcstrack' will then compute the centroids for each reference spot
+# in the current image.  For each coordinate of each spot, fcstrack
+# will compute the difference that spot's centroid in the current image
+# and its corresponding spot in the reference image.  For each coordinate,
+# the differences for each of the N spots are averaged together to yield
+# mean offset.  The mean offsets in X and in Y are used to close the loop.
+#
+#############################################################################
+# 
+# Single-spot mode	
+#
+# This mode is provided primarily for backward compatibility with the 
+# original FCS system that was deployed at the time of DEIMOS commissioning.
+# It enables the use of pre-existing reference files produced under that
+# original system, or regeneration of archival reference files in that format.
+# Its use for creating new reference files is strongly discouraged.
+#
+# For this mode, fcsref is invoked with three arguments:
+#
+# 	fcsref	SPOT_CENTROID_X  SPOT_CENTROID_Y  SPOT_PEAK_VALUE
+#
+# The first two arguments corresponds to the figdisp (X,Y) coordinates
+# of the centroid for a single reference spot that must be located on
+# FCS CCD 1.  The third argument corresponds to the peak value of that
+# spot.
+#
+# The centroid coordinates should be specified to a precision of 0.1 pixel.
+# Fcsref will not accept reference spots that are within 30 pixels of any
+# edge of FCS CCD 1 or whose peak pixel value is less than 1800 DN.
+#
+# In this mode, the FCS control loop (i.e., 'fcstrack') will perform a
+# cross-correlation of the current FCS image with the respective
+# FCS reference image for the purposes of offsetting the centroiding
+# box for the single reference spot in the current image.  In this manner,
+# the centroiding box will always track the reference spots, thus
+# avoiding the problem of FCS losing lock on the reference spot.
+# 'fcstrack' will then compute the centroid for that reference spot
+# in the current image.  For each coordinate, fcstrack will compute
+# the difference that spot's centroid in the current image and its
+# corresponding spot in the reference image.  Those differences in
+# X and Y are used to close the loop.
+#
+#############################################################################
+#
+# reference file naming conventions:
+#
+# In this release of the FCS system, the reference file naming conventions
+# have been extended to support reference file names that contain the filter
+# name, i.e., file names of the form:
+#
+#   fcsref.GRATING_NAME.sliderNUMBER.at.TILT_WAVELENGTH.FILTER_NAME.ref
+#
+# Examples of reference file names using this new format are:
+#
+#   fcsref.1200G.slider3.at.7800.013672.OG550.ref
+#
+#   fcsref.900ZD.slider4.at.4600.044434.BAL12.ref
+#
+#   fcsref.Mirror.slider2.at.0.0.V.ref
+#
+# This new naming convention enables one to generate reference files that
+# are specific for use with a given filter, thus accommodating the use of
+# more than one filter when operating with a given grating and grating tilt.
+# When 'fcsref' is used in either "spotless" or "multi-spot" mode, it will
+# generate reference file names in the new format, i.e., with filter names.
+#
+# When 'fcsref' is used in "single-spot" mode, it will generate reference
+# file names in the old format, i.e., without filter names, for purposes
+# of backward compatability with the original version of the FCS system.
+# Examples of reference file names using that old format are:
+#
+#   fcsref.1200G.slider3.at.7800.013672.ref
+#
+#   fcsref.900ZD.slider4.at.4600.044434.ref
+#
+#   fcsref.Mirror.slider2.at.0.0.ref
+#
+# When searching for a reference file that matches the current instrument
+# configuration, 'fcstrack' will now first try to find an exact match, i.e.,
+# a new-format reference file whose name contains a filter name that matches
+# the currently selected filter.  If it fails to find such a match, it will 
+# next search for an old-format reference file (i.e., one not containing
+# a filter name) that matches the current configuration with respect to
+# the grating name, slider number, and grating tilt.
+#
+#########################################################################
+# Contents of the reference file
+#
+# In "spotless" mode, the contents are as follows:
+#
+# REFNAME (the name of this file)
+# deimot.GRATENAM
+# deimot.GRATEPOS
+# deirot.ROTATVAL
+# deimot.GxTLTWAV
+# deimot.DWFILNAM
+# deimot.DWFOCRAW
+# deimot.FLAMPS
+# deifcs.TTIME
+# deifcs.OUTDIR
+# deifcs.OUTFILE
+# deifcs.LFRAMENO 
+#
+# In "multi-spot" mode, the contents are as follows, where there are N
+# lines of the form "Xi Yi PEAKi" at the end of the file, one line for
+# each of the N reference spots defined, i.e.:
+#
+# REFNAME (the name of this file)
+# deimot.GRATENAM
+# deimot.GRATEPOS
+# deirot.ROTATVAL
+# deimot.GxTLTWAV
+# deimot.DWFILNAM
+# deimot.DWFOCRAW
+# deimot.FLAMPS
+# deifcs.TTIME
+# deifcs.OUTDIR
+# deifcs.OUTFILE
+# deifcs.LFRAMENO 
+# X1 Y1 PEAK1
+# .....
+# XN YN PEAKN
+#
+# In "single-spot" mode, the contents are the same as they were in the
+# original FCS system, where the centroid coordinates and peak value are
+# provided for only a single reference spot, i.e.,
+#
+# REFNAME (the name of this file)
+# deimot.GRATENAM
+# deimot.GRATEPOS
+# deirot.ROTATVAL
+# deimot.GxTLTWAV
+# deimot.DWFILNAM
+# deimot.DWFOCRAW
+# deimot.FLAMPS
+# deifcs.TTIME
+# deifcs.OUTDIR
+# deifcs.OUTFILE
+# deifcs.LFRAMENO 
+# X
+# Y
+# PEAK
+#
+###########################################################################
+# Version 2.0  December 20, 2002  R. Kibrick
+###########################################################################
+
+# echo argv is $argv
+# echo count of arguments in argv is $#argv
+
+# Determine operating mode based on number of arguments specified
+
+if( $#argv == 0 ) then
+  set mode = "spotless"
+else if( $#argv == 1 ) then
+  set mode   = "multi-spot"
+  set nspot = $1
+else if( $#argv == 3 ) then
+  set mode   = "single-spot"
+else
+  echo invalid number of arguments \($#argv\) specified
+  echo number of arguments should be:
+  echo 0 for spotless mode (default), 1 for multi-spot, 3 for single-spot
+  goto abort
+endif
+
+echo fcsref will operate in $mode mode
+
+set gratenam=`show -s deimot -terse gratenam`
+if( $status ) then
+  echo "error reading grating name"
+  goto abort
+endif
+
+set gratepos=`show -s deimot -terse gratepos`
+if( $status ) then
+  echo "error reading grating position"
+  goto abort
+endif
+
+if( $gratepos == 2 ) then
+  set tiltwav = 0.0
+else if ( $gratepos == 3 ) then
+  set tiltwav=`show -s deimot -terse g3tltwav`
+  if( $status ) then
+    echo "error reading slider 3 grating tilt wavelength"
+    goto abort
+  endif
+else if ( $gratepos == 4 ) then
+  set tiltwav=`show -s deimot -terse g4tltwav`
+  if( $status ) then
+    echo "error reading slider 4 grating tilt wavelength"
+    goto abort
+  endif
+else
+  echo "No slider is currently clamped in position"
+  echo "You must have a slider clamped in order to capture the reference spot"
+  goto abort
+endif
+
+set dwfilnam = `show -s deimot -terse dwfilnam`
+if( $status ) then
+  echo "error reading filter name"
+  goto abort
+endif
+
+# echo gratenam is $gratenam
+# echo gratepos is $gratepos
+# echo tiltwav is $tiltwav
+# echo dwfilnam is $dwfilnam
+# echo about to set refname
+
+if( "$mode" == "single-spot" ) then
+  set refname="fcsref."$gratenam".slider"$gratepos".at."$tiltwav".ref"
+else
+  set refname="fcsref."$gratenam".slider"$gratepos".at."$tiltwav"."
+  set temp=$refname$dwfilnam
+  set refname=$temp".ref"
+endif
+
+echo This FCS reference file will be $refname
+
+if( -e $refname ) then
+  echo file already exists, renaming to $refname.$$
+  mv $refname $refname.$$
+endif
+
+# Create a fresh reference file of this name 
+touch $refname
+
+# Now fill in the contents of this file
+echo $refname   >> $refname
+echo $gratenam  >> $refname
+echo $gratepos  >> $refname
+
+set rotatval = `show -s deirot -terse rotatval`
+if( $status ) then
+  echo "error reading DEIMOS position angle"
+  goto abort
+endif
+
+echo $rotatval >> $refname
+
+# Get integer value of PA for threshold test
+set pa = `echo $rotatval | /usr/bin/sed "s/\./ /"`
+set pa = $pa[1]
+
+# echo DEIMOS position angle is $rotatval, integer PA is $pa 
+
+if ( $gratepos == 2 ) then
+  echo 0.0 >> $refname
+  if( ($pa != -5) && ($pa != -365) ) then
+     echo "DEIMOS PA of $pa is not centered on flexure curve for slider 2"
+     echo "Please reseet DEIMOS PA to -5 and re-take spot images"
+     goto abort
+  endif
+else if ( $gratepos == 3 ) then
+  if( ($pa < -31) || ($pa > -29) ) then
+     echo "DEIMOS PA of $pa is not centered on flexure curve for slider 3"
+     echo "Please use fcszero command to reset DEIMOS PA to -30"
+     echo "Then re-take the spot images"
+     goto abort
+  endif
+  show -s deimot -terse g3tltwav >> $refname
+  if( $status ) then
+    echo "error reading slider 3 tilt wavelength"
+    goto abort
+  endif
+  set g3tltoff = `show -s deimot -terse g3tltoff`
+  if( $status ) then
+    echo "error reading slider 3 tilt offset"
+    goto abort
+  endif
+  if( $g3tltoff ) then
+     echo "DEIMOS slider 3 tilt offset $g3tltoff is not centered in its range"
+     echo "Please use fcszero command to re-center slider 3 tilt offset"
+     echo "Then re-take the spot images"
+     goto abort
+  endif
+else if ( $gratepos == 4 ) then
+  if( ($pa < -31) || ($pa > -29) ) then
+     echo "DEIMOS PA of $pa is not centered on flexure curve for slider 4"
+     echo "Please use fcszero command to reset DEIMOS PA to -30"
+     echo "Then re-take the spot images"
+     goto abort
+  endif
+  show -s deimot -terse g4tltwav >> $refname
+  if( $status ) then
+    echo "error reading slider 4 tilt wavelength"
+    goto abort
+  endif
+  set g4tltoff = `show -s deimot -terse g4tltoff`
+  if( $status ) then
+    echo "error reading slider 4 tilt offset"
+    goto abort
+  endif
+  if( $g4tltoff ) then
+     echo "DEIMOS slider 3 tilt offset $g4tltoff is not centered in its range"
+     echo "Please use fcszero command to re-center slider 3 tilt offset"
+     echo "Then re-take the spot images"
+     goto abort
+  endif
+else
+  echo "No grating is currently clamped down"
+  goto abort
+endif
+
+set tmirrval = `show -s deimot -terse tmirrval`
+if( $status ) then
+  echo "error reading DEIMOS tent mirror position"
+  goto abort
+endif
+
+# Get integer value of tent mirror position for threshold test
+set tmirr = `echo $tmirrval | /usr/bin/sed "s/\./ /"`
+set tmirr = $tmirr[1]
+
+if( $tmirr != 45 ) then
+  echo "DEIMOS tent mirror position of $tmirrval is not centered in its range"
+  echo "Please use fcszero command to recenter the tent mirror"
+  echo "Then re-take the spot images"
+  goto abort
+endif
+
+set dwxl8raw = `show -s deimot -terse dwxl8raw`
+if( $status ) then
+  echo "error reading DEIMOS X translation stage position"
+  goto abort
+endif
+
+# Get integer value of DEIMOS X translation stage position for threshold test
+set dwxl8 = `echo $dwxl8raw | /usr/bin/sed "s/\./ /"`
+set dwxl8 = $dwxl8[1]
+
+if( ($dwxl8 < -755) || ($dwxl8 > -745) ) then
+  echo "DEIMOS X translation stage value $dwxl8raw is not centered in its range"
+  echo "Please use fcszero command to recenter the DEIMOS X translation stage"
+  echo "Then re-take the spot images"
+  goto abort
+endif
+
+echo $dwfilnam >> $refname
+
+show -s deimot -terse dwfocraw >> $refname
+if( $status ) then
+  echo "error reading focus"
+  goto abort
+endif
+
+set flamps=`show -s deimot -terse flamps`
+if( $status ) then
+  echo "error reading FCS lamps"
+  goto abort
+endif
+if( $flamps[1] == "Off" ) then
+  echo "None of the FCS lamps are turned on."
+  echo "You must have an FCS lamp on to capture a spot"
+  goto abort
+endif
+# echo \"$flamps\" >> $refname
+# Need to determine how we are going to handle the case of both Cu lamps
+# turned on
+echo $flamps >> $refname
+
+set ttime=`show -s deifcs -terse ttime`
+if( $status ) then
+  echo "error reading FCS exposure time"
+  goto abort
+endif
+if( $ttime < 1 ) then
+  echo "The FCS exposure time of $ttime seconds is too short"
+  goto abort
+else if ( $ttime > 30 ) then
+  echo "The FCS exposure time of $ttime seconds is too long"
+  goto abort
+endif
+echo $ttime    >> $refname
+
+show -s deifcs -terse outdir   >> $refname
+if( $status ) then
+  echo "error reading FCS output directory"
+  goto abort
+endif
+
+show -s deifcs -terse outfile  >> $refname
+if( $status ) then
+  echo "error reading FCS output file number"
+  goto abort
+endif
+
+show -s deifcs -terse lframeno >> $refname
+if( $status ) then
+  echo "error reading FCS frame number"
+  goto abort
+endif
+
+if( $mode == "single-spot" ) then
+  # Get integer versions of the coordinates and peak value and
+  # then sanity check them before writing them into the file
+
+  set x = `echo $1 | /usr/bin/sed "s/\./ /"`
+  # echo integer value of X is $x[1]
+
+  set y = `echo $2 | /usr/bin/sed "s/\./ /"`
+  # echo integer value of Y is $y[1]
+
+  set peak = `echo $3 | /usr/bin/sed "s/\./ /"`
+  # echo peak is $peak $#peak
+  # echo integer value of PEAK is $peak[1]
+
+  if( ($x[1] < 30) || ($x[1] > 2370) ) then
+    echo "invalid X coordinate $1 specified.  Must be >= 60 and <= 2380"
+    goto abort
+  endif
+
+  if( ($y[1] < 430) || ($y[1] > 570) ) then
+    echo "invalid Y coordinate $2 specified.  Must be >= 430 and <= 570"
+    goto abort
+  endif
+
+  if( ($peak[1] < 2000) || ($peak[1] > 65535) ) then
+    echo "invalid peak value $3 specified.  Must be between 2000 and 65535"
+    goto abort
+  endif
+
+  echo $1 >> $refname
+  echo $2 >> $refname
+  echo $peak[1] >> $refname
+
+else if( $mode == "multi-spot" ) then
+
+  set ispot = 1
+  while( $ispot <= $nspot )
+
+    echo "Enter X coordinate for reference spot $ispot"
+    set x = $<
+
+    set temp = `echo $x[1] | /usr/bin/sed "s/\./ /"`
+    
+    if( ($temp[1] <   30) || ($temp[1] > 2370) || \
+      ( ($temp[1] > 1170) && ($temp[1] < 1230) ) ) then
+      echo
+      echo X coordinate $x[1] is too close to the edge of the CCD.
+      echo Please specify an X coordinate at least 30 pixels from an edge.
+      echo
+      continue
+    endif
+  
+    echo "Enter Y coordinate for reference spot $ispot"
+    set y = $<
+    set temp = `echo $y[1] | /usr/bin/sed "s/\./ /"`
+
+    if( ($temp[1] < 430) || ($temp[1] > 570) ) then
+      echo
+      echo Y coordinate $y[1] is too close to the edge of the CCD.
+      echo Please specify an Y coordinate at least 30 pixels from an edge.
+      echo
+      continue
+    endif
+
+    echo "Enter peak pixel value for refernce spot $ispot"
+    set peak = $<
+    set temp = `echo $peak[1] | /usr/bin/sed "s/\./ /"`
+
+    if( ($temp[1] < 2000) || ($temp[1] > 65535) ) then
+      echo
+      echo "Peak pixel value is invalid."
+      echo "Please specify a peak pixel value that is between 2000 and 65536"
+      echo
+      continue
+    endif
+
+    echo "You entered X = $x[1]   Y = $y[1]   PEAK = $peak[1]"
+    echo "Is this correct? (y/n)"
+    set reply = $<
+    if( ($reply != "y") && ($reply != "Y") && ($reply != "yes") ) continue
+
+    echo $x[1] $y[1] $peak[1] >> $refname
+    @ ispot = $ispot + 1
+  end
+endif
+
+echo " "
+echo " "
+echo "#############################################"
+echo "fcsref successful. Contents of snapshot file:"
+cat $refname
+echo "#############################################"
+echo " "
+echo " "
+exit 0
+
+abort:
+echo " "
+echo "#############################################"
+echo "fcsref unsuccessful, aborting"
+echo "#############################################"
+/bin/rm -f $refname
+exit 1

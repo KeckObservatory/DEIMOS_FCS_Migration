@@ -1,0 +1,34 @@
+# Configuration file for FCS
+
+# Rotator value for the center of flexure of Slider 2. 
+# Rather than a range, it is a fixed rotator position.
+# A value of -999 means no limit.
+
+SLIDER2_FLEXURE_CENTER = -5.0 
+
+# Rotator value for the center of flexure of Slider 3. 
+# A value -999 means no limit.
+
+SLIDER3_FLEXURE_CENTER = -999 
+
+# Rotator value for the center of flexure of Slider 4.
+# A value -999 means no limit.
+
+SLIDER4_FLEXURE_CENTER = -30.0 
+
+# Tent mirror central position.
+
+TENT_MIRROR_CENTER = -45
+
+# Dewar translation stage central position.
+
+DEWAR_TRANSLATION_STAGE_CENTER = -750
+
+# Lower and upper limits for the FCS integration time.
+
+FCS_MIN_EXPTIME = 1
+FCS_MAX_EXPTIME = 30
+
+# Gratings optical model coefficient 
+
+

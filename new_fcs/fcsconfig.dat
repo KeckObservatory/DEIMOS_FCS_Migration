@@ -1,0 +1,125 @@
+# Configuration file for FCS
+
+# Offline FCS CCD:
+#
+# 0 --> Both CCDs are on line
+# 1 --> CCD1 is offline
+# 2 --> CCD2 is offline 
+
+OFFLINE = 0
+
+# Blink mode:
+#
+# 0 --> Lamps will be enabled continuously
+# 1 --> Lamps will be on only during FCS exposures
+
+BLINK = 0
+
+# FCS detector configuration
+
+WINDOW = 1,0,400,1200,200
+BINNIG = 1,1
+AUTOSHUT = 1
+
+# Focus tolerance (default FCSFOTO2 = 200 on 2018-02-01)
+
+FCSFOTO1 = 200
+FCSFOTO2 = 600
+
+# Default CuAr lamp
+
+FCSCUSEL = Cu1
+
+# Cross-correlation box size
+
+FCSBOXX = 0.250
+FCSBOXY = 0.250
+
+# Nominal tilt value for Zeroth Order
+
+G3TLTNOM_ZO = -74906
+
+# Rotator value for the center of flexure of Slider 2. 
+# Rather than a range, it is a fixed rotator position.
+# A value of -999 means no limit.
+
+SLIDER2_FLEXURE_CENTER = -5.0 
+SLIDER2_FLEXURE_CENTER_DELTA = 5.0
+
+# Rotator value for the center of flexure of Slider 3. 
+# A value -999 means no limit.
+
+SLIDER3_FLEXURE_CENTER = -999 
+SLIDER3_FLEXURE_CENTER_DELTA = -999
+
+# Rotator value for the center of flexure of Slider 4.
+# A value -999 means no limit.
+
+SLIDER4_FLEXURE_CENTER = -30.0
+SLIDER4_FLEXURE_CENTER_DELTA = 5.0
+
+# Tent mirror central position.
+
+TENT_MIRROR_CENTER = -45
+TENT_MIRROR_CENTER_DELTA = 1
+
+# Dewar translation stage central position.
+
+DEWAR_TRANSLATION_STAGE_CENTER = -750
+DEWAR TRANSLATION_STAGE_CENTER_DELTA = 5
+
+# Central wavelength accuracy (number of 
+# significant digits):
+
+CENTRAL_WAVELENGTH_ACCURACY = 1
+
+# Central wavelength error margin (Angstroms). The
+# central wavelength can vary in the range 
+# CENTRAL_WAVELENGTH -/+ CENTRAL_WAVELENGTH_DELTA:
+
+CENTRAL_WAVELENGTH_DELTA = 0.2
+
+# Lower and upper limits for the FCS integration time.
+
+FCS_MIN_EXPTIME = 1
+FCS_MAX_EXPTIME = 30
+
+# Valid grating names:
+
+VALID_GRATING_NAMES = 600ZD,830G,900ZD,1200G,1200B,Mirror
+
+# Valid grating positions:
+
+VALID_GRATING_POSITIONS = 2,3,4
+
+# Gratings optical model coefficient: 
+
+MODEL1_NAME = 600ZD
+MODEL1_SCALE = -0.000006452
+MODEL1_ZERO = 3723
+MODEL1_OFFSET = 0.2338
+
+MODEL2_NAME = 830G
+MODEL2_SCALE = -0.000009102
+MODEL2_ZERO = 4984
+MODEL2_OFFSET = 0.2129
+
+MODEL3_NAME = 900ZD
+MODEL3_SCALE = -0.000009847
+MODEL3_ZERO = 4631
+MODEL3_OFFSET = 0.2126
+
+MODEL4_NAME = 1200G
+MODEL4_SCALE = -0.00001447
+MODEL4_ZERO = 5577
+MODEL4_OFFSET = 0.1856
+
+MODEL5_NAME = 1200B
+MODEL5_SCALE = -0.00001447
+MODEL5_ZERO = 5577
+MODEL5_OFFSET = 0.1856
+
+MODEL6_NAME = Mirror
+MODEL6_SCALE = 0.0
+MODEL6_ZERO = 0
+MODEL6_OFFSET = 0.256

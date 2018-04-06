@@ -1,0 +1,258 @@
+#! /kroot/rel/default/bin/kpython
+"""
+fcsref -- Capture the relevant configuration parameters of
+          for the reference image.
+
+Purpose:    
+
+Script to capture the relevant configuration parameters of DEIMOS for the
+FCS reference image obtained for the reference state of the current
+instrument configuration.
+
+To obtain an FCS reference image for a given instrument configuration,
+the observer should perform the following steps:
+
+1. Configure DEIMOS for a particular observational setup (i.e., select
+grating or mirror, set grating tilt, select filter, adjust focus)
+ 
+2. Run the 'fcszero' script to rotate DEIMOS to the reference PA (i.e.,
+the PA that corresponds to the center of the flexure curve for this
+configuration) and drive the tent mirror, dewar translate, and
+appropriate grating stage to their respective central positions.
+Note that the obsever must have control of the DEIMOS rotator
+(i.e., ROTATDCS=false), the rotator must be in postion mode (i.e.,
+ROTATMOD=pos), and the rotator must be unlocked (ROTATLCK=unlocked).
+
+3. Take one or more FCS images (adjusting FCS integration time) until
+a usable FCS image is obtained.  That image should be saved to disk
+(i.e., set DISK WRITE ENABLED on the FCS xpose GUI or set the
+FCS keyword TODISK equal to 1.
+
+Usage:
+
+fcsref
+
+Arguments:
+
+None
+
+Output:
+
+FCS reference file
+
+Restrictions:
+
+Reference file naming conventions:
+
+In this release of the FCS system, the reference file naming conventions
+have been extended to support reference file names that contain the filter
+name, i.e., file names of the form:
+
+  fcsref.GRATING_NAME.sliderNUMBER.at.TILT_WAVELENGTH.FILTER_NAME.ref
+
+Examples of reference file names using this new format are:
+
+  fcsref.1200G.slider3.at.7800.0.OG550.ref
+
+  fcsref.900ZD.slider4.at.4600.0.GG455.ref
+
+  fcsref.Mirror.slider2.at.0.0.V.ref
+
+Contents of the reference file:
+
+REFNAME (the name of this file)
+deimot.GRATENAM
+deimot.GRATEPOS
+deirot.ROTATVAL
+deimot.GxTLTWAV
+deimot.DWFILNAM
+deimot.DWFOCRAW
+deimot.FLAMPS
+deifcs.TTIME
+deifcs.OUTDIR
+deifcs.OUTFILE
+deifcs.LFRAMENO 
+
+Example:
+
+fcsref
+
+Modification history:
+
+2017-Aug-03     CA     Original version based on the cshell script
+                       fcsref by R. Kibrick (2002)
+
+"""
+
+#-----------------------#
+# Import Python modules #
+#-----------------------#
+
+import sys, os
+import ktl
+from random import randint
+import numpy as np
+from fcs_exceptions import *
+
+#------------------#
+# Define constants #
+#------------------#
+
+FCS_CONFIG_FILE = 'fcsconfig.dat'
+
+#------------------#
+# Define functions #
+#------------------#
+
+def parseConfigFile():
+
+    """
+    Read configuration file, parse content
+    and create a dictionary with the file content.
+    """
+
+    f = open(FCS_CONFIG_FILE, 'r')
+    data = f.readlines()
+    f.close()
+    
+    param_set = {}
+    
+    for line in data:
+        
+        if ( len(line.strip()) != 0 ):
+
+            if ( line.strip()[0] != '#' ):
+
+                key = line.strip().split('=')[0].strip()
+                value = line.strip().split('=')[1].strip()
+
+                param_set[key] = value
+
+    return param_set
+
+#--------------#
+# Main program #
+#--------------#
+
+#--------------------------------------------#
+# Load configuration from fcsconfig.dat file #
+#--------------------------------------------#
+
+config = parseConfigFile()
+
+print (config)
+
+# Parse the list of valid grating positions
+
+VALID_GRATING_POS = config['VALID_GRATING_POSITIONS'].split(',')
+
+# Parse the list of valid grating names
+
+VALID_GRATING_NAM = config['VALID_GRATING_NAMES'].split(',')
+
+#----------------------------------#
+# Connect to keyword services,     #
+# monitor keywords and check that  #
+# the current configuration is     #
+# adequate to take a reference     #
+# frame.                           #
+#----------------------------------#
+
+deimot = ktl.cache('deimot')
+deirot = ktl.cache('deirot')
+deifcs = ktl.cache('deifcs')
+
+# Monitor grating name
+
+gratenam = deimot['GRATENAM']
+gratenam.monitor()
+if ( gratenam not in VALID_GRATING_NAM ):
+    raise InvalidGratingName(gratenam)
+
+# Monitor slider position
+
+gratepos = deimot['GRATEPOS']
+gratepos.monitor()
+if ( gratepos not in VALID_GRATING_POS ):
+    raise InvalidSliderPosition(gratepos)
+
+# Monitor grating central wavelength
+
+if ( gratepos == 2 ):
+    tltwav = 0.0
+else:
+    grtltwav = deimot['G'+str(gratepos)+'TLTWAV']
+    grtltwav.monitor()
+    tltwav = grtltwav
+
+# Round the wavelength to the number of significant
+# digits defined in the configuration file
+
+wavel = np.around(float(tltwav), \
+                  decimals=int(config['CENTRAL_WAVELENGTH_ACCURACY']))
+
+print(wavel)
+
+# Monitor filer name
+
+dwfilnam = deimot['DWFILNAM']
+dwfilnam.monitor()
+
+# Monitor rotator value
+
+rotatval = deirot['ROTATVAL']
+rotatval.monitor()
+
+# Monitor the FCS output directory
+
+outdir = deifcs['OUTDIR']
+outdir.monitor()
+
+output_dir = '/s'+str(outdir)
+output_dir = '/home/calvarez/Work/scripts/deimos/test_data'
+
+os.chdir(output_dir)
+
+# Construct the FCS reference file name
+
+refname = 'fcsref.' + gratenam + '.slider' + str(gratepos) + '.at.' +\
+          str(wavel) + '.' + dwfilnam + '.ref'
+
+# Rename the file name if already exists
+
+if os.path.isfile(refname):
+    suffix = str("%05d" % randint(00000,99999))
+    os.rename(refname, refname+'.'+suffix)
+
+#--------------------------------------#
+# Write the FCS reference file in disk #
+#--------------------------------------#
+
+try:
+    f = open(refname, 'w')
+except:
+    raise FcsWriteNotAllowed(refname, output_dir)
+
+f.write(refname + '\n')
+f.write(gratenam + '\n')
+f.write(str(gratepos) + '\n')
+f.write(str(rotatval) + '\n')
+f.write(str(wavel) + '\n')
+f.write(str(output_dir) + '\n')
+
+f.close()
+
+print ('')
+print ('#############################################')
+print ('')
+print ('fcsref successful. Contents of snapshot file:')
+
+f = open(refname, 'r')
+print (f.read())
+f.close()
+
+print ('#############################################')
+print ('')
+
+sys.exit(0)
+

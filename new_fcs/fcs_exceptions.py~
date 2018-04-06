@@ -1,0 +1,105 @@
+#! /kroot/rel/default/bin/kpython
+"""
+fcs_exceptions -- List a series of exceptions definitions that are specific to
+                  the operation of the FCS system.
+
+Purpose: 
+
+To define a series of exceptions that are specific to the operation of
+the DEIMOS FCS trracking software.
+
+
+Usage:
+
+N/A
+
+Arguments:
+
+N/A
+
+Output:
+
+N/A
+
+Restrictions:
+
+None
+
+Example;
+
+N/A
+
+Modification history:
+
+2017-Oct-20     CA     Original version
+      
+"""
+
+#----------------#
+# Import modules #
+#----------------#
+
+import sys
+
+#------------------#
+# Define constants #
+#------------------#
+
+ERROR_CODE_INVALID_GRATING_NAME = -100
+ERROR_CODE_INVALID_SLIDER_POSITION = -101
+ERROR_CODE_CANNOT_WRITE_FCS_FILE = -102
+
+#-------------------#
+# Define exceptions #
+#-------------------#
+
+class InvalidGrating(Exception):
+
+    """Exception when the slider is not in the correct state"""
+
+class InvalidGratingName(InvalidGrating): 
+
+    """Exception when the grating name is not correct"""
+
+    def __init__(self, name):
+
+        self.name = name
+        error_code = ERROR_CODE_INVALID_GRATING_NAME
+
+        msg = "ERROR %d: Grating name %s is not valid for FCS." \
+              % (error_code, name)
+
+        print (msg)
+        sys.exit(error_code)
+
+class InvalidSliderPosition(InvalidGrating):
+
+    """Exception when the slider position is not correct"""
+
+    def __init__(self, pos):
+
+        self.pos = pos
+        error_code = ERROR_CODE_INVALID_SLIDER_POSITION
+
+        msg = "ERROR %d: Grating postion number %d is not valid for FCS." \
+              % (error_code, pos)
+
+        print(msg)
+        sys.exit(error_code)
+
+class FcsWriteNotAllowed(IOError):
+
+    """Exception when it is not possivble to write a file
+       in the current FCS data directory.
+    """
+
+    def __init__(self, file, dir):
+
+        error_code = ERROR_CODE_CANNOT_WRITE_FCS_FILE
+
+        msg = "ERROR %d: Cannot write %s in %s." \
+              % (error_code, file, dir)
+
+        print(msg)
+        sys.exit(error_code)
+

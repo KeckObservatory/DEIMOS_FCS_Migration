@@ -1,0 +1,3853 @@
+#!/bin/csh -f
+#
+# fcstrack
+#
+# Script for implementing the FCS control loop by cross-correlating
+# the current FCS image against the reference FCS image.  The script can also
+# optionally track the centroids of up to 9 reference spots which can be 
+# distributed between both FCS CCDs 1 and 2.  The reference image, as well
+# as the definitions for the optional reference spots, are defined in the
+# reference file whose filename matches the current configuration of the
+# instrument.  Such reference files are generated using the fcsref command.
+# See the comments in the fcsref command for a more detailed description
+# of the three different modes in which the fcstrack script can operate:
+# spotless (default), multi-spot, and single-spot.
+#
+# If no reference file exists that matches the current configuration of the
+# instrument, then FCS tracking is inhibited until such time as either:
+#   1. A reference file matching the current configuration is created, or
+#   2. The instrument configuration is changed to correspond to an existing
+#      reference file
+#	
+# Starting with version 2.1.6, we attempt to detect spurious corrections that
+# can result if one of the two FCS CCDs is hit by a large cosmic ray event.
+# Unfortunately, this is not a simple matter of comparing the corrections
+# generated from the two CCDs for a single iteration, because the corrections
+# from each CCD can differ from each other due to scale changes that can
+# occur within the camera due to changes in temperature and/or position angle.
+# Instead, we compare the respective corrections for each CCD between the
+# current iteration and the previous iteration, and assume that for small
+# changes in position angle the changes in the corrections computed between
+# the two iterations should be nearly the same from each of the two FCS CCDs.
+#
+# Starting with version 4.1.1, we are using the new deifcs keyword library
+# rather than a logical link to the ESI keyword library.  As such, keywords
+# like fcsmode and fcsmsg have now moved from the deiccd service to the 
+# deifcs service.
+#
+# Syntax for invoking this command:
+#
+# 	fcstrack
+#
+# Version 4.2.1  2005 Dec 09 R. Kibrick
+
+set noglob
+
+onintr interrupt
+
+###########################################################################
+# For normal operation using the images from both CCDs, set offline = 0
+# For emergency operation with FCS CCD #1 inoperative,  set offline = 1
+# For emergency operation with FCS CCD #2 inoperative,  set offline = 2
+########################################################################### 
+set offline = 0
+
+if( $offline == 1 ) then
+ echo "*** FCS CCD #1 has been marked offline ***"
+ modify -s deifcs fcsmsg="*** FCS CCD #1 has been marked offline ***" fcserr=-99
+ sleep 5
+else if ($offline == 2 ) then
+ echo "*** FCS CCD #2 has been marked offline ***"
+ modify -s deifcs fcsmsg="*** FCS CCD #2 has been marked offline ***" fcserr=-99
+ sleep 5
+else
+ echo "*** Both FCS CCDS #1 and #2 will be used ***"
+endif
+
+modify -s deifcs fcserr =0
+
+
+# The coefficients in these tables are based on Drew Phillip's optical
+# model for DEIMOS as documented in his e-mail of 25 Mar 2003 17:56:59 -0800
+#
+set name   = (     600ZD         830G        900ZD      1200G     Mirror  )
+set scale  = ( -0.000006452 -0.000009102 -0.000009847 -0.00001447   0.0   )
+set zero   = (    3723         4984         4631         5577       0     )
+set offset = (  0.2338       0.2129       0.2126       0.1856       0.256 )
+
+# Define size of the box used for centroiding.
+# Because of somewhat diffuse spots on FCS CCD 2, a size of 25 is needed
+# These definitions are only relevant in multi-spot or single-spot mode
+set nr=25
+set nc=25
+set mr=25
+
+set fcsmode = `show -s deifcs -terse -binary fcsmode`
+if( $status ) then
+  error reading deifcs keyword FCSMODE
+  set fcsmode      = 0    # Start out idling
+endif
+
+set refname      = "null"
+set confname     = "null"
+set names_set    = 1
+
+set lastfcsmode  = -1	# force state change
+set lastgntoff   = 10000
+set lastrefname  = "none"
+set lastconfname = "none"
+set last_frameno = -1	# impossible frame number
+set last_fcserr  = 9999
+set howlong	 = 1000
+set exposip_ctr  = 2
+set idle_timer   = -1
+set conf_change  = 1	# Prime the pump
+set flush_pending = 1    # Prime the pump
+
+# Set initial values for csh variables that are mapped to keywords
+set fcserr        = 0	# no errors
+
+set fcstask       = 0   # idle
+set last_fcstask  = -1  # force broadcast
+
+set fcssta	  = 0	# passive
+set last_fcssta   = -1	# force broadcast
+
+set fcsstate      = 1	# idle
+set last_fcsstate = -1	# force broadcast
+
+set fcstrack      = 1	# not correcting
+set last_fcstrack = -1   # force broadcast
+
+set fcsrmsx1_sam  = ()
+set fcsrmsx2_sam  = ()
+set fcsrmsxd_sam  = ()
+set fcsrmsxm_sam  = ()
+set fcsrmsy1_sam  = ()
+set fcsrmsy2_sam  = ()
+set fcsrmsyd_sam  = ()
+set fcsrmsym_sam  = ()
+
+set fcskws = \
+  `show -s deifcs -terse fcsskips fcsccnox fcsccnoy fcsexnox fcsexnoy fcshbeat`
+
+echo fcskws at startup= $fcskws
+
+set fcsskips      = $fcskws[1]
+set fcsccnox	  = $fcskws[2]
+set fcsccnoy	  = $fcskws[3]
+set fcsexnox	  = $fcskws[4]
+set fcsexnoy	  = $fcskws[5]
+set fcshbeat	  = $fcskws[6]
+
+set fcsslbad	  = 0
+set fcsetmis	  = 0
+set fcslamis	  = 0
+set fcsfomis	  = 0
+set fcstmlim	  = 0
+set fcsdxlim	  = 0
+set fcsgtlim	  = 0
+
+set fcsnogra	  = 0
+set fcsnosli      = 0
+set fcsnowav      = 0
+set fcsnofil      = 0
+set fcsnofoc      = 1
+
+# Need to check for changes in focus from one iteration to the next
+set last_dwfocraw = -999999
+
+set x_integ       = 0
+set y_integ       = 0
+
+# Force an initial set of updates
+set last_fcsnogra = -1
+set last_fcsnosli = -1
+set last_fcsnowav = -1
+set last_fcsnofil = -1
+set last_fcsnofoc = -1
+
+set last_fcstmlim = -1
+set last_fcsdxlim = -1
+set last_fcsgtlim = -1
+set last_fcsetmis = -1
+set last_fcsfomis = -1
+set last_fcslamis = -1
+set last_fcsslbad = -1
+
+modify -s deifcs window=1,0,400,1200,200
+modify -s deifcs binning=1,1
+modify -s deifcs autoshut=1
+
+set delta_xpoly = ( 0.0 0.0 0.0 )
+set delta_ypoly = ( 0.0 0.0 0.0 )
+set last_xpoly  = ( 0.0 0.0 0.0 )
+set last_ypoly  = ( 0.0 0.0 0.0 )
+set last_rotatval = -999.999
+
+set x_track_min =  999.999
+set x_track_max = -999.999
+set y_track_min =  999.999
+set y_track_max = -999.999
+ 
+set x_slew_min =  999.999
+set x_slew_max = -999.999
+set y_slew_min =  999.999
+set y_slew_max = -999.999
+
+# clear_pending == 1 indicates that the skip counters and RMS counters need
+# to be cleared to zero at the start of the next science exposure
+
+set clear_pending = 0
+
+# Announce that we are starting up
+set message = \
+	 "fcstrack Version 4.2.1 starting at `date` with offline=$offline"
+echo $message
+modify -s deifcs nowait fcsmsg="$message"
+
+# Get tolerance values
+set fcsfoto1 = `show -s deifcs -terse fcsfoto1`
+if( $status ) then
+  echo error reading fcsfoto1 keyword, defaulting to 100
+  set fcsfoto1 = 100
+endif
+echo focus tolerance 1 is $fcsfoto1
+
+set fcsfoto2 = `show -s deifcs -terse fcsfoto2`
+if( $status ) then
+  echo error reading fcsfoto1 keyword, defaulting to 600
+  set fcsfoto1 = 600
+endif
+echo focus tolerance 2 is $fcsfoto2
+
+set fcscusel = "`show -s deifcs -terse fcscusel`"
+if( $status ) then
+  echo error reading fcscusel keyword, defaulting to "Cu1"
+  set fcscusel = "Cu1"
+endif
+echo The default CuAr lamp is currently $fcscusel
+set active_flamp = "none"
+
+set fcsboxes = `show -s deifcs -terse fcsboxx fcsboxy`
+if( $status ) then
+  echo error reading fcsboxx, fcsboxy keywords, defaulting to 0.25 pixel
+  set fcsboxx = 0.25
+  set fcsboxy = 0.25
+else
+  set fcsboxx = $fcsboxes[1]
+  set fcsboxy = $fcsboxes[2]
+endif
+echo FCS box in X is $fcsboxx pixels, in Y is $fcsboxy pixels
+
+# Define the nominal tilt value (G3TLTNOM) that corresponds to the zero-order
+# tilt, regardless of which grating is installed in slider 3
+set g3tltnom_zero_order = -74906
+
+# Establish blink mode;
+# set blink = 1		# Lamps will blink on only during FCS exposure
+set blink = 0		# Lamps will be enable continously, toggled by box
+
+
+goto update_state
+
+
+interrupt:
+
+   modify -s deifcs nowait \
+	  fcssta=passive fcsstate=idle fcstrack="not correcting" fcstask="Idle"
+
+   modify -s deifcs nowait fcsreffi=" " fcsimgfi=" " fcslogfi=" "
+
+   modify -s deifcs nowait fcsintxm=0.0 fcsintym=0.0 
+   modify -s deimot flamps=off
+
+   set message = "fcstrack shut down at `date`"
+   echo "$message"
+   set fcserr  = -300
+
+   modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+
+   sleep 2
+   modify -s deifcs nowait fcserr=0
+
+   exit 1
+
+#############################################################################
+# We are going to ignore the FCS image from this iteration because
+# the difference between the X corrections from FCS CCD 1 and 2
+# exceeded the threshold
+
+ignore_ccnox:
+    @ fcsccnox = $fcsccnox + 1
+    modify -s deifcs nowait fcsccnox=$fcsccnox
+    echo ignoring this image, fcsccnox=$fcsccnox
+    goto ignore_this_image
+  
+
+#############################################################################
+# We are going to ignore the FCS image from this iteration because
+# the difference between the Y corrections from FCS CCD 1 and 2
+# exceeded the threshold
+
+ignore_ccnoy:
+    @ fcsccnoy = $fcsccnoy + 1
+    modify -s deifcs nowait fcsccnoy=$fcsccnoy
+    echo ignoring this image, fcsccnoy=$fcsccnoy
+    goto ignore_this_image
+  
+
+#############################################################################
+# We are going to ignore the FCS image from this iteration because
+# we have computed N>1 excessive X corrections in a row
+
+ignore_exnox:
+    modify -s deifcs nowait fcsexnox=$fcsexnox
+    echo ignoring this image, fcsexnox=$fcsexnox
+    goto ignore_this_image
+  
+
+#############################################################################
+# We are going to ignore the FCS image from this iteration because
+# we have computed N>1 excessive Y corrections in a row
+
+ignore_exnoy:
+    modify -s deifcs nowait fcsexnoy=$fcsexnoy
+    echo ignoring this image, fcsexnoy=$fcsexnoy
+    goto ignore_this_image
+  
+
+#############################################################################
+# We are going to ignore the FCS image from this iteration because
+# there was some general problem with it.  Increment the generic
+# image skip counter and set the state to WARNING
+
+ignore_this_image:
+    @ fcsskips = $fcsskips + 1
+    modify -s deifcs nowait fcsskips=$fcsskips
+    echo ignoring this image, fcsskips=$fcsskips
+    set fcstrack = 1 # NOT CORRECTING
+    goto state_warning
+
+
+#############################################################################
+# We are going to ignore the FCS image from this iteration because
+# there was some emergency detected after exposure end.  Increment the
+# generic image skip counter and set the state to EMERGENCY
+
+emergency_ignore_image:
+    @ fcsskips = $fcsskips + 1
+    modify -s deifcs nowait fcsskips=$fcsskips
+    echo ignoring this image, fcsskips=$fcsskips
+    set fcstrack = 1 # NOT CORRECTING
+    goto state_emergency
+
+#############################################################################
+# We come here on conditions which set fcstate to IDLE-grey
+
+state_idle:
+    set fcsstate = 1 # IDLE
+    set fcstrack = 1 # NOT CORRECTING
+    set fcstask  = 0 # IDLE
+    goto log_error_retry
+
+
+#############################################################################
+# We come here on conditions which set fcstate to WARNING-yellow
+
+state_warning:
+    set fcsstate = 2 # WARNING
+    goto log_error_retry
+
+
+#############################################################################
+# We come here on conditions which set fcstate to LOCKOUT-red
+
+state_lockout:
+    # echo at state_lockout
+
+    if( $fcsmode == 0 ) then
+      set fcsstate = 1 # IDLE
+    else
+      set fcsstate = 3 # LOCKOUT
+    endif
+
+    # echo fcsstate is $fcsstate
+
+    set fcstask  = 0 # IDLE
+
+    if( $fcsnogra != $last_fcsnogra ) then
+      modify -s deifcs nowait fcsnogra=$fcsnogra
+      set last_fcsnogra = $fcsnogra
+    endif
+
+    if( $fcsnosli != $last_fcsnosli ) then
+      modify -s deifcs nowait fcsnosli=$fcsnosli
+      set last_fcsnosli = $fcsnosli
+    endif
+
+    if( $fcsnowav != $last_fcsnowav ) then
+      modify -s deifcs nowait fcsnowav=$fcsnowav
+      set last_fcsnowav = $fcsnowav
+    endif
+
+    if( $fcsnofil != $last_fcsnofil ) then
+      modify -s deifcs nowait fcsnofil=$fcsnofil
+      set last_fcsnofil = $fcsnofil
+    endif
+
+    if( $fcsnofoc != $last_fcsnofoc ) then
+      modify -s deifcs nowait fcsnofoc=$fcsnofoc
+      set last_fcsnofoc = $fcsnofoc
+    endif
+    goto log_error_retry
+
+
+#############################################################################
+# We come here on conditions which set fcstate to EMERGENCY-red
+
+state_emergency:
+    set fcsstate = 4 # EMERGENCY
+    goto log_error_retry
+
+
+
+#############################################################################
+# Log error messages, delay a second, and retry 
+
+log_error_retry:
+    echo " "
+    if( $fcserr < 0 ) then
+	echo "ERROR $fcserr $message at `date`"
+    else
+        echo "msgnum=$fcserr  $message at `date`"
+    endif
+    if( $last_fcserr != $fcserr ) then
+      modify -s deifcs nowait fcsmsg="$message"
+      if( $fcserr < 0 ) then
+        modify -s deifcs nowait fcserr=$fcserr
+      endif
+      set last_fcserr = $fcserr
+    endif
+    sleep 1
+
+
+#############################################################################
+#############################################################################
+
+# Here is the normal top of the loop
+
+#############################################################################
+#############################################################################
+
+update_state:
+
+  set deifcskw = `show -s deifcs -terse -binary fcsmode fcserr fcscusel`
+  if( $status ) then
+    set message = "error reading external fcsmode, fcserr, or fcscusel"
+    set fcserr  = -21
+    goto state_emergency
+  endif
+
+  set fcsmode         = $deifcskw[1]
+  set external_fcserr = $deifcskw[2]
+  set fcscusel        = $deifcskw[3]
+
+  #echo at updated_state, fcsmode= $fcsmode, fcserr= $fcserr, fcscusel=$fcscusel
+  #echo refname= $refname, confname= $confname, flush_pending= $flush_pending
+
+  # If the external fcserr doesn't match what we last set, and if it
+  # is < 0, then clear it
+  # Clear any previous ERROR state
+  if( ($external_fcserr < 0) && ($external_fcserr != $last_fcserr) ) then
+    set fcserr = 0
+    modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+    set lastfcserr = $fcserr
+  endif
+
+  if( ( ($active_flamp[1] == "Cu1") || ($active_flamp[1] == "Cu2") ) && \
+        ($fcscusel[1] != $active_flamp[1]) ) then
+     set active_flamp = $fcscusel
+     set message = "Switching to $fcscusel lamp as the default CuAr source"
+     echo "$message at `date`"
+     set fcserr = 170
+     if( $last_fcserr != $fcserr ) then
+       modify -s deifcs nowait fcsmsg="$message"
+       set last_fcserr = $fcserr
+     endif
+  endif
+
+  # Send notification of any changes in FCS TASK
+  if( $last_fcstask != $fcstask ) then
+    modify -s deifcs nowait fcstask=$fcstask
+    set last_fcstask = $fcstask
+  endif
+
+  # Send notification of any changes in FCS STATE
+  if( $last_fcsstate != $fcsstate ) then
+    echo fcsstate just changed from $last_fcsstate to $fcsstate
+    modify -s deifcs nowait fcsstate=$fcsstate
+    set last_fcsstate = $fcsstate
+  endif
+
+  # Send notification of any changes in FCS TRACK
+  if( $last_fcstrack != $fcstrack ) then
+    echo fcstrack just changed from $last_fcstrack to $fcstrack
+    modify -s deifcs nowait fcstrack=$fcstrack
+    set last_fcstrack = $fcstrack
+  endif
+
+  #  Here is where we compute the current master status based
+  #  on the current values of fcsstate and fcstrack.  This logic is
+  #  based on the memo from Wirth and Faber, "Proposed Design for FCS GUI",
+  #  dated January 2, 2003.
+
+  if(       $fcsstate == 4 ) then
+    set fcssta = 6           # Red/Emergency
+  else if(  $fcsstate == 3 ) then
+    set fcssta = 5           # Red/Lockout
+  else if(  $fcstrack == 3 ) then
+    set fcssta = 4           # Red/Off-target
+  else if( ($fcsstate == 0) && ($fcstrack == 2) ) then
+    set fcssta = 3           # Yellow/Seeking 
+# else if( ($fcsstate == 2) && ($fcstrack == 0) ) then
+  else if(  $fcsstate == 2 ) then
+    set fcssta = 2           # Yellow/Warning
+  else if( ($fcsstate == 0) && ($fcstrack == 0) ) then
+    set fcssta = 1	     # Green/Tracking
+  else if( ($fcsmode  == 0) || ($fcsmode  == 1) || \
+           ($fcsstate == 1) || ($fcstrack == 1) ) then
+    set fcssta = 0	     # Grey/passive
+  else
+    set fcssta = 6	     # When in doubt, sound the alarm
+  endif
+
+  # Send notification of any changes in FCS master STATUS
+  if( $last_fcssta != $fcssta ) then
+    echo fcssta just changed from $last_fcssta to $fcssta
+    modify -s deifcs nowait fcssta=$fcssta
+    set last_fcssta = $fcssta
+  endif
+
+  # Send notification re: exposure time mismatch
+  if( $last_fcsetmis != $fcsetmis ) then
+    echo fcsetmis just changed to $fcsetmis
+    modify -s deifcs nowait fcsetmis=$fcsetmis
+    set last_fcsetmis = $fcsetmis
+  endif
+    
+  # Send notification re: FCS lamp mismatch
+  if( $last_fcslamis != $fcslamis ) then
+    echo fcslamis just changed to $fcslamis
+    modify -s deifcs nowait fcslamis=$fcslamis
+    set last_fcslamis = $fcslamis
+  endif
+
+  # Set initial state for this iteration to be OK.  It will remain set
+  # to OK so long as no other condition causes it to be reset to some
+  # other value.  So if it is still OK when we come around to the top
+  # of the loop the next time through, then everything is OK, and that
+  # is the state we will broadcast.
+  #
+  set fcsstate = 0
+
+  # Update the heartbeat keyword to notify the rest of the world that
+  # we are still running the main loop and have not hung or crashed
+
+  @ fcshbeat   = $fcshbeat + 1
+  @ fcshbeat   = $fcshbeat % 10000
+  modify -s deifcs nowait fcshbeat=$fcshbeat
+
+  @ howlong    = $howlong + 1
+  @ idle_timer = $idle_timer + 1
+
+# echo fcshbeat= $fcshbeat, howlong= $howlong, idle timer= $idle_timer at `date`
+
+  set fcskws = \
+      `show -s deifcs -terse fcsskips fcsccnox fcsccnoy fcsexnox fcsexnoy`
+
+  set fcsskips    = $fcskws[1]
+  set fcsccnox	  = $fcskws[2]
+  set fcsccnoy	  = $fcskws[3]
+  set fcsexnox	  = $fcskws[4]
+  set fcsexnoy	  = $fcskws[5]
+
+  set deimotkw = \
+   `show -s deimot -terse gratenam gratepos g3tltwav g3tltnom g4tltwav dwfilnam`
+
+  if( $status ) then
+    set message = \
+	 "error reading grating name, position, tilt wavelengths, or filter"
+    set fcserr = -21
+    goto state_emergency
+  endif
+
+# echo deimotkw = $deimotkw at `date`
+ 
+  set gratenam = $deimotkw[1]
+  set gratepos = $deimotkw[2]
+  set g3tltwav = $deimotkw[3]
+  set g3tltnom = $deimotkw[4]
+  set g4tltwav = $deimotkw[5]
+  set dwfilnam = $deimotkw[6]
+
+  if( ("$gratenam" == "Unknown") || ($gratepos == -999) ) then
+    set message="No slider is clamped down.  Slider change in progress?"
+    set fcserr = -51
+    set fcsnogra = 0
+    set fcsnosli = 0
+    set fcsnowav = 0
+    set fcsnofil = 0
+    set fcsnofoc = 0
+    set fcsintxm = 0.0
+    set fcsintym = 0.0
+    sleep 1
+    goto state_lockout
+  endif
+
+  if( $dwfilnam == "Unknown" ) then
+    set message = "Filter change in progress?"
+    set fcserr = 52
+    set fcsnofil = 0
+    set fcsnofoc = 0
+    sleep 1
+    goto state_lockout
+  endif
+
+  if( $gratepos == 2 ) then
+    set tiltwav = 0.0
+  else if ( $gratepos == 3 ) then
+    set tiltwav = `/bin/printf "%011.6f" $g3tltwav`
+  else if ( $gratepos == 4 ) then
+    set tiltwav = `/bin/printf "%011.6f" $g4tltwav`
+  else
+    set message="No slider is clamped down.  Slider change in progress?"
+    set fcserr = -51
+    set fcsnogra = 0
+    set fcsnosli = 0
+    set fcsnowav = 0
+    set fcsnofil = 0
+    set fcsnofoc = 0
+    set fcsintxm = 0.0
+    set fcsintym = 0.0
+    sleep 1
+    goto state_lockout
+  endif
+
+  set outdir   = `show -s deifcs -terse outdir`
+  if( $status ) then
+    set message = \
+	"error reading FCS output directory from deifcs service, retrying"
+    set fcserr = -22
+    goto state_emergency
+  endif
+
+  set approot="."$gratenam".slider"$gratepos".at."$tiltwav
+  set refroot="fcsref$approot"
+  set gainame=/local/u/kics/scripts/gain$approot
+  set logname=$outdir"/"$refroot"."$dwfilnam".log"
+  set confname=$refroot"."$dwfilnam
+
+ if( ("$confname" != "$lastconfname") || ($#refname == 0) ) then
+
+  set conf_change = 1
+  set flush_pending = 1
+  set lastconfname = $confname
+
+  # Calculate the count of reference files that match at least
+  # a part of this configuration
+  #=====================================================================
+    # Here is where we check the number of available matching files of 
+    # each type
+    set fcsnogra = 0
+    set fcsnosli = 0
+    set fcsnowav = 0
+    set fcsnofil = 0
+    set fcsnofoc = 0
+
+    foreach temp ( $outdir /home/dmoseng/fcs_reference )
+
+      # echo directory is $temp
+      /bin/rm -f /tmp/fcstrack.dirlist.$$
+      /bin/ls $temp > /tmp/fcstrack.dirlist.$$
+      # cat /tmp/fcstrack.dirlist.$$
+
+      set filelist = "fcsref."$gratenam".slider"
+      # echo grating filelist is "$filelist"
+      set listout  = `fgrep "$filelist" /tmp/fcstrack.dirlist.$$ | fgrep ".ref"`
+      # echo grating listout is "$listout"
+      @ fcsnogra = $fcsnogra + $#listout
+
+      set filelist = "fcsref."$gratenam".slider"$gratepos".at."
+      # echo slider filelist is "$filelist"
+      set listout  = `fgrep "$filelist" /tmp/fcstrack.dirlist.$$ | fgrep ".ref"`
+      # echo slider listout is "$listout"
+      @ fcsnosli = $fcsnosli + $#listout
+    
+      set filelist = "fcsref."$gratenam".slider"$gratepos".at."$tiltwav
+      # echo wavelength filelist is "$filelist"
+      set listout  = `fgrep "$filelist" /tmp/fcstrack.dirlist.$$ | fgrep ".ref"`
+      # echo wavelength listout is "$listout"
+      @ fcsnowav = $fcsnowav + $#listout
+
+      set filelist = \
+           "fcsref."$gratenam".slider"$gratepos".at."$tiltwav"."$dwfilnam".ref"
+      # echo filter filelist is "$filelist"
+      set listout  = `fgrep "$filelist" /tmp/fcstrack.dirlist.$$`
+      # echo filter listout is "$listout"
+      @ fcsnofil = $fcsnofil + $#listout
+    end 
+
+    if( $fcsnogra != $last_fcsnogra ) then
+      modify -s deifcs nowait fcsnogra=$fcsnogra
+      set last_fcsnogra = $fcsnogra
+    endif
+
+    if( $fcsnosli != $last_fcsnosli ) then
+      modify -s deifcs nowait fcsnosli=$fcsnosli
+      set last_fcsnosli = $fcsnosli
+    endif
+
+    if( $fcsnowav != $last_fcsnowav ) then
+      modify -s deifcs nowait fcsnowav=$fcsnowav
+      set last_fcsnowav = $fcsnowav
+    endif
+
+    if( $fcsnofil != $last_fcsnofil ) then
+      modify -s deifcs nowait fcsnofil=$fcsnofil
+      set last_fcsnofil = $fcsnofil
+    endif
+
+    if( $fcsnofoc != $last_fcsnofoc ) then
+      modify -s deifcs nowait fcsnofoc=$fcsnofoc
+      set last_fcsnofoc = $fcsnofoc
+    endif
+  #=====================================================================
+
+  # Search for a reference file that matches this configuration.
+  # Check in the current FCS output directory (OUTDIR) first, and give
+  # precedence to filenames that include the filter name.  If neither
+  # flavor of matching reference file is found in OUTDIR, then check the
+  # archival reference in dmoseng account.
+
+  set refname = ()
+
+  foreach temp ( $outdir"/"$refroot"."$dwfilnam".ref" \
+                 $outdir"/"$refroot".ref" \
+		 /home/dmoseng/fcs_reference/$refroot"."$dwfilnam".ref" \
+		 /home/dmoseng/fcs_reference/$refroot".ref" )
+
+      # echo searching for $temp
+
+      if( -e $temp ) then
+	# echo match found for $temp
+
+        if( -r $temp == 0 ) then
+          set message = \
+          "This account does not have read access to the reference file $temp"
+          set fcserr = -23
+	  echo "ERROR $fcserr  $message"
+          if( $fcserr != $last_fcserr ) then
+      	     modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+             set last_fcserr = $fcserr
+          endif
+          continue
+        endif
+
+	set refname = $temp
+	set message = "reference file for this configuration is $refname"
+        break
+
+      endif
+  end
+
+  if( $#refname == 0 ) then
+    if( $names_set ) then
+      modify -s deifcs nowait fcsreffi=" " fcsimgfi=" "  fcslogfi=" "
+      set names_set = 0
+    endif
+    set lastrefname = "null"
+    sleep 1
+    goto check_mode
+  endif
+
+  # Make the reference and log file names visible to the outside world
+  modify -s deifcs nowait fcsreffi=$refname fcslogfi=$logname
+  set names_set = 1
+
+  if( (-e $logname) == 0 ) then
+    touch $logname
+    if( $status ) then
+      set fcsstate = 2 # WARNING
+      set message = \
+          "This account is unable to create logfile $logname in this directory"
+      set fcserr = -32
+      if( $fcserr != $last_fcserr ) then
+         modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+         set last_fcserr = $fcserr
+      endif
+    else
+      echo "Logfile $logname successfully created"
+    endif
+  endif
+  if( (-w $logname) == 0 ) then
+    set fcsstate = 2 # WARNING
+    set message = "This account lacks write access to the logfile $logname"
+    echo "$message"
+    set fcserr = -39
+    if( $fcserr != $last_fcserr ) then
+      modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+      set last_fcserr = $fcserr
+    endif
+  endif
+  
+# The reference file exists and is readable by this account.
+# Check if it is still the same file as it was on the last pass.
+
+  if( "$refname" != "$lastrefname" ) then
+
+    set flush_pending = 1
+
+    set message = "Configuration has just changed to $refname at `date`"
+    echo $message
+    set fcserr  = 1
+    modify -s deifcs nowait fcsmsg="$message"
+
+#   So read it in and cache it as a shell variable
+    set snapargs = `cat $refname`
+
+#   echo number of args is $#snapargs
+#   echo arguments are $snapargs
+
+    if( $#snapargs < 12 ) then
+	set message = "Incomplete reference file $refname, ignoring"
+ 	set fcserr = -24
+	goto state_lockout
+    endif
+
+    foreach i ( 1 2 3 4 5 6 7 8 9 10 11 12 )
+        echo argument $i is $snapargs[$i]
+
+    end
+
+    if( ($snapargs[8] == "Cu1") || ($snapargs[8] == "Cu2") ) then
+      set active_flamp = $fcscusel
+    else
+      set active_flamp = $snapargs[8]
+    endif
+
+    # Now construct the path to the reference image file
+    set outdir   = $snapargs[10]
+    set outfile  = $snapargs[11]
+    set frameno  = $snapargs[12]
+
+    echo reference image file outdir=  $outdir  
+    echo reference image file outfile= $outfile
+    echo reference image file frameno= $frameno 
+
+    # Pad with leading zeroes as needed
+    if ( $frameno < 10   )set frameno = "0"$frameno
+    if ( $frameno < 100  )set frameno = "0"$frameno
+    if ( $frameno < 1000 )set frameno = "0"$frameno
+    set refilename = $outdir"/"$outfile$frameno.fits
+
+    modify -s deifcs nowait fcsimgfi=$refilename
+
+    echo file name for reference image is $refilename
+
+    if( (-e $refilename) == 0 ) then
+      set message = \
+	 "expected FCS reference image file $refilename does not exist"
+      set lastrefname  = `date`
+      set lastconfname = `date`
+      set fcserr = -60
+      sleep 1
+      goto state_lockout
+    endif
+
+    if( (-r $refilename) == 0 ) then
+      set message = \
+        "This account lacks read access to the reference image file $refilename"
+      set lastrefname  = `date`
+      set lastconfname = `date`
+      set fcserr = -61
+      sleep 1
+      goto state_lockout
+    endif
+
+    @ nspot=($#snapargs - 12) / 3
+    @ check = 12 + (3 * $nspot)
+    # echo check = $check
+
+    if( $check != $#snapargs ) then
+	set fcsstate = 2 # WARNING
+        set message = \
+	   "incomplete spot triplet, nspot = $nspot in reference file $refname"
+	set fcserr = -62
+	echo "ERROR $fcserr: $message at `date`"
+        if( $fcserr != $last_fcserr ) then
+          modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+          set last_fcserr = $fcserr
+        endif
+        set nspot = 0	# Ignore all spots definitions in this reference file
+    endif
+
+    # echo nspot = $nspot
+
+    set iarg = 13
+
+    set bx = ()
+    set by = ()
+    set peak = ()
+    set peaklow = ()
+    set peakhigh = ()
+    set ccd = ()
+    set ispot = 1
+
+    while( $iarg <= $check )
+    
+      set temp = `echo $snapargs[$iarg] | /usr/bin/sed "s/\./ /"`
+
+      if( ($temp[1] <   30) || ($temp[1] > 2370) || \
+        ( ($temp[1] > 1170) && ($temp[1] < 1230) ) ) then
+          @iarg = $iarg + 3
+	  set fcsstate = 2 # WARNING
+	  set message = \
+          	"X coord = $temp[1] for spot $ispot too close to CCD edge"
+	  set fcserr = -64
+	  echo "ERROR $fcserr: $message at `date`"
+          if( $fcserr != $last_fcserr ) then
+            modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+            set last_fcserr = $fcserr
+          endif
+          continue
+      else if ($temp[1] <= 1170) then
+          set ccd = ($ccd 1)
+      else
+          set ccd = ($ccd 2)
+      endif
+
+      set bxi = $iarg
+      set bx  = ($bx `echo "$snapargs[$bxi] + 24" | bc`)
+      @ iarg  = $iarg + 1
+
+      set temp = `echo $snapargs[$iarg] | /usr/bin/sed "s/\./ /"`
+
+      if( ($temp[1] < 430) || ($temp[1] > 570) ) then
+          @iarg = $iarg + 2
+	  set fcsstate = 2 # WARNING
+	  set message = \
+          	"Y coord = $temp[1] for spot $ispot too close to CCD edge"
+	  set fcserr = -65
+	  echo "ERROR $fcserr: $message at `date`"
+          if( $fcserr != $last_fcserr ) then
+            modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+            set last_fcserr = $fcserr
+          endif
+          continue
+      endif
+
+      set byi = $iarg
+      set by  = ($by `echo "$snapargs[$byi] - 400" | bc`)
+      @ iarg  = $iarg + 1
+
+      set peaki = $iarg
+      set peak  = ($peak $snapargs[$peaki])
+      @ iarg    = $iarg + 1
+
+      set temp = `echo "0.50 * $peak[$ispot]" | bc`
+      set temp = `echo $temp | /usr/bin/sed "s/\./ /"`
+      set peaklow = ($peaklow $temp[1])
+
+      set temp = `echo "1.50 * $peak[$ispot]" | bc`
+      set temp = `echo $temp | /usr/bin/sed "s/\./ /"`
+      set peakhigh = ($peakhigh $temp[1])
+
+      echo reference spot $ispot from CCD $ccd[$ispot] is at \
+	 x,y = $bx[$ispot],$by[$ispot] with peak $peak[$ispot] and \
+         low = $peaklow[$ispot]  high= $peakhigh[$ispot]
+
+      @ ispot = $ispot + 1
+
+      if( $ispot > 9 ) then
+	set fcsstate = 2 # WARNING
+	set message = \
+	    "A maximum of 9 spots can be defined.  Remainder ignored."
+	set fcserr = -63
+	echo "ERROR $fcserr: $message at `date`"
+        if( $fcserr != $last_fcserr ) then
+          modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+          set last_fcserr = $fcserr
+        endif
+        break
+      endif
+    end
+
+    @ nspot = $ispot - 1
+    echo Number of valid spots is $nspot
+
+    # echo count $#bx  string $bx
+    # echo count $#by  string $by
+    # echo count $#peak  string $peak
+    # echo count $#peaklow  string $peaklow
+    # echo count $#peakhigh  string $peakhigh
+    # echo count $#ccd string $ccd
+
+    set ispot = 1
+    set cr = ()
+    set cc = ()
+    set nr = ()
+
+    while ( $ispot <= $nspot )
+
+      if( (-e $logname.$ispot) == 0 ) then
+         touch $logname.$ispot
+         if( $status ) then
+	   set fcsstate = 2 # WARNING
+           set message = \
+     "This account unable to create logfile $logname.$ispot in this directory"
+           set fcserr = -32
+	   echo "ERROR $fcserr: $message"
+           if( $fcserr != $last_fcserr ) then
+             modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+             set last_fcserr = $fcserr
+           endif
+         else
+           echo "Logfile $logname.$ispot successfully created"
+         endif
+       endif
+       if( (-w $logname.$ispot) == 0 ) then
+	set fcsstate = 2 # WARNING
+        set message = \
+	 "This account lacks write access to the logfile $logname.$ispot"
+        set fcserr = -39
+	echo "ERROR $fcserr: $message"
+        if( $fcserr != $last_fcserr ) then
+          modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+          set last_fcserr = $fcserr
+        endif
+      endif
+
+      set temp = `echo $by[$ispot] | /usr/bin/sed "s/\./ /"`
+      set cr   = ($cr $temp[1])
+
+      set temp = `echo $bx[$ispot] | /usr/bin/sed "s/\./ /"`
+      set cc   = ($cc $temp[1])
+
+      @ temp = 198 - $cr[$ispot]
+      # echo delta is $temp
+      @ temp = $temp + $temp
+      # echo height is $temp
+      if ( $temp > $mr ) set temp = $mr
+      # echo adjusted height is $temp
+
+      set nr = ($nr $temp)
+
+      echo box $ispot will be centered at $cc[$ispot],$cr[$ispot]
+      echo box $ispot will be $nc x $nr[$ispot] in size
+
+      @ ispot = $ispot + 1
+    end
+
+#   echo cr count $#cr string $cr
+#   echo cc count $#cc string $cc
+#   echo nr count $#nr string $nr
+
+    set lastrefname  = $refname
+ 
+    # Compute the gain if this is a grating or mirror that we know about.
+    # Otherwise, check for a gain file
+
+    set ix = 1
+    while ( $ix <= $#name )
+      if( "$gratenam" == "$name[$ix]" ) break;
+      @ ix = $ix + 1
+    end
+
+    if( $ix > $#name ) then
+
+      echo grating name $gratenam not in table, so unable to compute the gain
+      echo checking to see if a gain file exists for this configuration
+
+      if( (-e $gainame) == 0 ) then
+        set message = "No gain file for this configuration. Using default gain"
+        set fcserr = -25
+        echo "ERROR $fcserr  $message"
+        if( $fcserr != $last_fcserr) then
+          modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+          set last_fcserr = $fcserr
+        endif
+      else
+        if( (-r $gainame) == 0 ) then
+          set message= \
+           "Account lacks read access to gain file $gainame. Using default gain"
+          set fcserr = -26
+          echo "ERROR $fcserr: $message"
+          if( $fcserr != $last_fcserr ) then
+            modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+            set last_fcserr = $fcserr
+          endif
+        endif
+      endif
+
+      set altname = $gainame
+      if( ((-e $gainame) == 0) || ((-r $gainame) == 0) ) then
+        set message="Attempting to use default gain"
+        set fcserr = 2
+        echo $message
+        if( $fcserr != $last_fcserr) then
+          modify -s deifcs nowait fcsmsg="$message"
+          set last_fcserr = $fcserr
+        endif
+ 
+        set altname =  "/local/u/kics/scripts/gain."$gratenam
+        if( ((-e $altname) == 0) || ((-r $altname) == 0) ) then
+          set message="No default gain file $altname for grating $gratenam"
+          set fcserr = -27
+          goto state_lockout
+        endif
+      endif
+
+      # The gain for this combination of grating and tilt is contained
+      # in the gain file
+      echo about to obtain the gain for this configuration from $altname
+      set gain = `cat $altname`
+      echo gain raw from gain file is $gain at `date`
+
+    else
+      echo grating $gratenam corresponds to table element $ix
+      echo about to compute gain for grating $gratenam at tilt $tiltwav
+      set computed_gain = \
+      `echo "scale=6;($scale[$ix])*($tiltwav - $zero[$ix]) + $offset[$ix]" | bc`
+      echo computed gain value for $gratenam at $tiltwav is $computed_gain
+
+      set gain = `echo "scale=6;$computed_gain / 104.644444" | bc`
+      echo gain raw computed is $gain at `date`
+
+      ####################################################################
+      # N.B.: If we switch to using the computed_gain, we will need to
+      # convert to using TMIRRVAL rather than TMIRRRAW, and will need to
+      # change all of the midpoint references from 4709 to 45.0 and also
+      # adjust the checks for "near end of travel" and "at end of travel.
+      ####################################################################
+
+    endif # End of the ix is greater than name length block
+
+  endif	# End of the refname not equal to lastrefname block
+ else
+    # The configuration on this iteration is the same as it was on the
+    # previous iteration
+    set conf_change = 0
+ endif  # End of the confname not equal to lastconfname block
+
+  ######## End of reference file initialization section ########
+
+  # echo at end of reference file initialization
+
+  if( $#refname == 0 ) then
+    if( $fcsnogra && $fcsnosli && ($fcsnowav == 0) ) then
+      set message = \
+ "Current grating tilt does not EXACTLY match tilt of reference image"
+    else
+      set message = \
+        "FCS tracking is not currently available in this configuration."
+    endif
+    set fcserr =  20
+    goto state_lockout
+  endif
+
+  # If we get to here we must have a matching configuration 
+  if( $fcsnogra == 0 ) set fcsnogra = 1
+  if( $fcsnosli == 0 ) set fcsnosli = 1
+  if( $fcsnowav == 0 ) set fcsnowav = 1
+  if( $fcsnofil == 0 ) set fcsnofil = 1
+
+  # And update keywords as needed
+  if( $fcsnogra != $last_fcsnogra ) then
+    modify -s deifcs nowait fcsnogra=$fcsnogra
+    set last_fcsnogra = $fcsnogra
+  endif
+
+  if( $fcsnosli != $last_fcsnosli ) then
+    modify -s deifcs nowait fcsnosli=$fcsnosli
+    set last_fcsnosli = $fcsnosli
+  endif
+
+  if( $fcsnowav != $last_fcsnowav ) then
+    modify -s deifcs nowait fcsnowav=$fcsnowav
+    set last_fcsnowav = $fcsnowav
+  endif
+
+  if( $fcsnofil != $last_fcsnofil ) then
+    modify -s deifcs nowait fcsnofil=$fcsnofil
+    set last_fcsnofil = $fcsnofil
+  endif
+
+  set deimotkw = \
+      `show -s deimot -terse dwfilnam dwfocraw slmsknam slarmpos`
+  if( $status ) then
+    set message = \
+       "error reading dwfilnam, dwfocraw, slmsknam, or slarmpos"
+    set fcserr = -28
+    goto state_emergency
+  endif
+
+  # echo deimotkw $deimotkw at `date`
+
+  set dwfilnam = $deimotkw[1]
+  set dwfocraw = $deimotkw[2]
+  set slmsknam = $deimotkw[3]
+  set slarmpos = $deimotkw[4]
+
+  # We need to read this separately since value can have embedded spaces
+  set flamps = "`show -s deimot -terse flamps`"
+  if( $status ) then
+    set message = "error reading flamps"
+    set fcserr = -128
+    goto state_emergency
+  endif
+
+  # We need to read this separately since value can have embedded spaces
+  set lamps = (`show -s deimot -terse lamps`)
+  if( $status ) then
+    set message = "error reading lamps"
+    set fcserr = -129
+    goto state_emergency
+  endif
+
+  if( "$dwfilnam" == "Unknown" ) then
+    set message = "Filter change in progress?"
+    set fcserr =  52
+    set fcsnofil = 0
+    set fcsnofoc = 0
+    goto state_lockout
+  endif
+
+  if( "$dwfilnam" != "$snapargs[6]" ) then
+    set message = \
+	"Filter $dwfilnam does not match reference configuration $snapargs[6]"
+    set fcserr = -29
+    set fcsnofil = 0
+    set fcsnofoc = 0
+    set confname = "filter_mismatch"
+    goto state_lockout
+  endif
+
+  @ focuslow  = $snapargs[7] - $fcsfoto1
+
+  @ focushigh = $snapargs[7] + $fcsfoto1
+  # Convert focus to an integer for threshold test
+  set temp = `echo $dwfocraw | /usr/bin/sed "s/\./ /"`
+  set focus = $temp[1]
+
+  if( $fcsmode && (($focus < $focuslow) || ($focus > $focushigh)) ) then
+    set fcsfomis = 1
+    set fcsstate = 2 # WARNING
+    set message = \
+      "Focus $dwfocraw does not match reference focus $snapargs[7]"
+    echo $message
+    set fcserr  = -30
+  else
+    set fcsfomis = 0
+  endif
+
+# echo fcsfomis is $fcsfomis
+
+  if( $last_fcsfomis != $fcsfomis ) then
+    echo fcsfomis just changed to $fcsfomis
+    modify -s deifcs nowait fcsfomis=$fcsfomis
+    set last_fcsfomis = $fcsfomis
+  endif
+
+  @ focuslow  = $snapargs[7] - $fcsfoto2
+  @ focushigh = $snapargs[7] + $fcsfoto2
+
+  if( $fcsmode && (($focus < $focuslow) || ($focus > $focushigh)) ) then
+    set message = \
+	"focus $dwfocraw is too far from reference focus $snapargs[7]"
+    set fcserr = -110
+    set fcsnofoc = 0
+    set confname = "focus_mismatch"
+    goto state_lockout
+  endif
+
+  if( $last_fcserr != $fcserr ) then
+    modify -s deifcs nowait fcsmsg="$message"
+    set last_fcserr = $fcserr
+  endif
+
+  if( $fcsnofoc == 0 ) set fcsnofoc = 1
+  if( $fcsnofoc != $last_fcsnofoc ) then
+    modify -s deifcs nowait fcsnofoc=$fcsnofoc
+    set last_fcsnofoc = $fcsnofoc
+  endif
+
+check_mode:
+  # echo at check_mode
+
+  if( $#refname == 0 ) then
+    if( $fcsnogra && $fcsnosli && ($fcsnowav == 0) ) then
+      set message = \
+ "Current grating tilt does not EXACTLY match tilt of reference image"
+    else
+      set message = \
+        "FCS tracking is not currently available in this configuration."
+    endif
+    set fcserr =  20
+  endif
+
+  set fcskw   = `show -s deifcs -terse -binary fcsmode frameno`
+  if( $status ) then
+    set message = "error reading fcsmode or frameno keyword, retrying"
+    set fcserr = -31
+    goto state_emergency
+  endif
+  # echo fcskw $fcskw
+
+  set fcsmode = $fcskw[1]
+  set frameno = $fcskw[2]
+  # echo fcsmode is $fcsmode frameno is $frameno
+
+  if( $fcsmode != $lastfcsmode ) then
+    set fcserr = 3
+    set message = "FCS mode changed from $lastfcsmode to $fcsmode"
+    echo $message
+    if( $fcserr != $last_fcserr ) then
+      modify -s deifcs nowait fcsmsg="$message"
+      set last_fcserr = $fcserr
+    endif
+    set lastfcsmode = $fcsmode
+
+    # If the FCS mode just changed to mode 0, turn off the FCS lamps
+    if( $fcsmode == 0 ) then
+#     This code disable 14 May 2003 in order to support the acquisition
+#     of matching reference frames.  If an FCS non-dark exposure is not
+#     in progress, then the lamps are implicitly turned off in any case.
+#     modify -s deimot flamps=off
+#     if( $status ) then
+#       set message = "Error attempting to turn off FCS lamps"
+#       set fcserr  = -47
+#       goto state_emergency
+#     endif
+    else
+      if( $#refname == 0 ) goto state_lockout
+      # We have a matching reference for this configuration, 
+      # so notify the outside world that we are no longer idle
+      # by updating status to seeking, OK, seeking.
+      set fcsstate = 0 # OK
+      set fcssta   = 3 # Seeking
+      set fcstrack = 2 # Seeking
+      modify -s deifcs nowait \
+	 fcsstate=$fcsstate fcssta=$fcssta fcstrack=$fcstrack
+    endif
+  endif
+
+  if( $fcsmode == 0 ) then
+     # Check if someone has taken a new reference frame.  If so,
+     # then the current frame number will have changed from what it
+     # was the last time we came through here.
+
+     if( $frameno != $last_frameno ) then
+       echo frameno has changed from $last_frameno to $frameno while in mode 0
+       # Force re-evaluation of the reference file and image 
+       set refname = ()
+       set lastrefname = "`date`"
+       set lastconfname = "`date`"
+       set last_frameno = $frameno
+     endif
+
+     set message = "FCS mode is 0, so control loop is idle"
+     set fcserr = 0
+     goto state_idle
+  endif
+
+  echo " "
+  # echo fcsmode is $fcsmode, refname is $refname, confname is $confname
+
+  if( $#refname == 0 ) then
+	 set fcstrack = 1
+	 goto state_lockout
+  else
+	if( $fcstrack == 1 ) set fcstrack = 2 
+  endif
+
+  set deiccdkw = \
+ `show -s deiccd -terse -binary eraseip exposip pauseip wcrate ttime elaptime`
+  if( $status ) then
+    set message = "error reading eraseip exposip pauseip wcrate ttime elaptime"
+    set fcserr = -33
+    goto state_emergency
+  endif
+  
+  # echo deiccdkw $deiccdkw at `date`
+
+  set eraseip  = $deiccdkw[1]
+  set exposip  = $deiccdkw[2]
+  set pauseip  = $deiccdkw[3]
+  set wcrate   = $deiccdkw[4]
+  set ttime    = $deiccdkw[5]
+  set elaptime = $deiccdkw[6]
+
+  if( $eraseip ) then
+    set idle_timer = 0
+    set message = "science CCD mosaic is erasing at `date`"
+    set fcserr  = 5
+    set fcstask = 0 # IDLE
+    set clear_pending = 1
+    goto log_error_retry
+  endif
+
+  # echo science mosaic exposip is $exposip at `date`
+
+  # Update flags based on science exposure state
+  if( $exposip ) then
+    set idle_timer = 0
+    set exposip_ctr = 2
+
+    if( $clear_pending ) then
+
+      # A new science exposure has just started.  Thus,
+      # we need to explicitly clear the skip and RMS counters
+      # before proceeding with the next FCS exposure.
+
+      set fcskws = \
+          `show -s deifcs -terse fcsskips fcsccnox fcsccnoy fcsexnox fcsexnoy`
+
+      # echo fcskws at clear_pending = $fcskws
+
+      set fcsskips        = $fcskws[1]
+      set fcsccnox	  = $fcskws[2]
+      set fcsccnoy	  = $fcskws[3]
+      set fcsexnox	  = $fcskws[4]
+      set fcsexnoy	  = $fcskws[5]
+
+      echo New science exposure just started, clearing skip and RMS counters
+
+      if( $fcsccnox ) then
+        set fcsccnox = 0
+        modify -s deifcs nowait fcsccnox=$fcsccnox
+      endif
+
+      if( $fcsccnoy ) then
+        set fcsccnoy = 0
+        modify -s deifcs nowait fcsccnoy=$fcsccnoy
+      endif
+
+      if( $fcsexnox ) then
+        set fcsexnox = 0
+        modify -s deifcs nowait fcsexnox=$fcsexnox
+      endif
+
+      if( $fcsexnoy ) then
+        set fcsexnoy = 0
+        modify -s deifcs nowait fcsexnoy=$fcsexnoy
+      endif
+
+      if( $fcsskips ) then
+        set fcsskips = 0
+        modify -s deifcs nowait fcsskips=$fcsskips
+      endif
+
+      set fcsrmsx1_sam = ()
+      set fcsrmsx2_sam = ()
+      set fcsrmsxd_sam = ()
+      set fcsrmsxm_sam = ()
+      set fcsrmsy1_sam = ()
+      set fcsrmsy2_sam = ()
+      set fcsrmsyd_sam = ()
+      set fcsrmsym_sam = ()
+
+      modify -s deifcs nowait fcsrmsx1=0.0 fcsrmsy1=0.0 \
+                              fcsrmsx2=0.0 fcsrmsy2=0.0 \
+                              fcsrmsxm=0.0 fcsrmsym=0.0 \
+                              fcsrmsxd=0.0 fcsrmsyd=0.0
+
+      set clear_pending = 0
+      echo Skip and RMS counters have been cleared at `date`
+    endif
+  else
+    # If no science exposure currently in progress, then set
+    # the clear_pending flag.  This will cause the skip and RMS
+    # counters to be cleared at the start of the next science
+    # exposure
+    set clear_pending = 1
+
+    if( $exposip_ctr ) then
+      @ exposip_ctr = $exposip_ctr - 1
+      # echo exposip_ctr is $exposip_ctr
+    endif
+  endif
+
+  if( $pauseip ) then
+    set idle_timer = 0
+    set message = "Science CCD mosaic exposure is paused, FCS locked out"
+    set fcserr  = 6
+    goto state_lockout
+  endif
+  
+  if( $wcrate ) then
+    set idle_timer = 0
+    set clear_pending = 1
+    set message = "Science CCD mosaic is reading out, FCS locked out"
+    set fcserr = 7
+    set fcstask = 0 # IDLE
+    goto state_lockout
+  endif
+  
+# echo ttime is $ttime and elaptime is $elaptime at `date`
+  @ remtime = $ttime - $elaptime
+# echo remtime is $remtime
+
+# echo current tilt for slider $gratepos is $tiltwav
+# echo current slider is $gratepos
+
+  if( $blink == 0 ) then
+    # echo checkpt 1 $#flamps $flamps[1] $#active_flamp $active_flamp
+    if( "$flamps" != "$active_flamp" ) then
+      set message = \
+     "current FCS lamp state $flamps does not match reference $active_flamp"
+      set fcserr = -34
+      echo "WARNING $fcserr, $message"
+      if( $fcserr != $last_fcserr ) then
+        modify -s deifcs nowait fcsmsg="$message"
+        set lastfcserr = $fcserr
+      endif
+      echo about to turn on $active_flamp lamp at `date`
+      modify -s deimot flamps=$active_flamp
+      if( $status ) then
+        set message = \
+          "Error turning on FCS lamp $active_flamp"
+        set fcslamis = 1
+	set fcserr = -35
+	goto state_emergency
+      else
+	set message = "Turned on FCS lamp $active_flamp"
+	set fcserr  = 8
+	echo $message
+        if( $fcserr != $last_fcserr ) then
+          modify -s deifcs nowait fcsmsg="$message"
+          set lastfcserr = $fcserr
+        endif
+        set flamps=$active_flamp
+      endif
+    else
+      set fcslamis = 0
+    endif
+
+    if( $last_fcslamis != $fcslamis ) then
+      echo fcslamis just changed to $fcslamis
+      modify -s deifcs nowait fcslamis=$fcslamis
+      set last_fcslamis = $fcslamis
+    endif
+  else
+    echo FCS lamps will only be turned on during FCS exposures
+  endif
+
+  set fcs_ttime = `show -s deifcs -terse ttime`
+  if( $status ) then
+    set message = \
+      "error reading FCS exposure time\(TTIME keyword\) from deifcs service"
+    set fcserr  = -36
+    goto state_emergency
+  endif
+
+  if( $fcs_ttime != $snapargs[9] ) then
+    set message = \
+    "FCS exposure time $fcs_ttime s does not match reference $snapargs[9]s"
+    set fcserr = -37
+    echo "WARNING $fcserr, $message"
+    if( $fcserr != $last_fcserr ) then
+      modify -s deifcs nowait fcsmsg="$message"
+      set last_fcserr = $fcserr
+    endif
+    echo about to set FCS exposure time to $snapargs[9] at `date`
+    modify -s deifcs ttime=$snapargs[9]
+    if( $status ) then
+	set message = \
+         "error attempting to set FCS exposure time to $snapargs[9], retrying"
+        set fcserr = -38
+        set fcsetmis = 1
+      goto state_emergency
+    else
+      set fcs_ttime = $snapargs[9]
+    endif
+  else
+    set fcsetmis = 0
+  endif
+
+  if( $last_fcsetmis != $fcsetmis ) then
+    echo fcsetmis just changed to $fcsetmis
+    modify -s deifcs nowait fcsetmis=$fcsetmis
+    set last_fcsetmis = $fcsetmis
+  endif
+    
+  set shutstat = "`show -s deiccd -terse shutstat`"
+  if( $status ) then
+    set message = \
+     "error reading shutter status SHUTSTAT keyword from deiccd service"
+    set fcserr  = -40
+    goto state_emergency
+  endif
+  # echo shutter status is $shutstat at `date`
+
+  if( "$shutstat[1]" == "open" ) set idle_timer = 0
+
+  # echo lamps status is $lamps
+
+# NOTE: Each cycle takes about 5 seconds, so 3 cycles consumes 15s
+  if( ($fcsmode == 4) && ($idle_timer > 3) ) then
+
+# NOTE: Each cycle takes about 5 seconds, so 120 cycles consumes 600s (10m)
+    if( $howlong < 120 ) then
+      echo fcsmode is 4, but only $howlong loop cycles since last convergence
+    else
+      echo fcsmode=4, $howlong cycles since last acquire, time to re-acquire
+
+      if( "$lamps[1]" != "Off" ) then
+        set message = \
+	  "fcsmode 4 is turning off the $lamps comparison lamps at `date`"
+        set fcserr = -41
+        echo "WARNING $fcserr: $message"
+        if( $fcserr != $last_fcserr ) then
+	  modify -s deifcs nowait fcsmsg="$message"
+	  set last_fcserr = $fcserr
+        endif
+
+        modify -s deimot lamps=Off
+        if( $status ) then
+	  set message = \
+             "error commanding the $lamps comparison lamps off, retrying"
+	  set fcserr = -42
+          goto state_emergency
+        endif
+
+#       Now refresh the lamps status variable
+        set lamps = (`show -s deimot -terse lamps`)
+        if( $status ) then
+	   set message = \
+             "error reading comparison lamp status \(LAMPS keyword\), retrying"
+           set fcserr = -43
+           goto state_emergency
+        endif
+        echo lamp status is $lamps at `date`
+      else
+        echo the comparison lamps are already off
+      endif
+    endif
+  endif
+
+  # echo checkpt 2
+  if( "$lamps[1]" != "Off" ) then
+    if( $#lamps == 1 ) then
+      set message = "comparison lamp $lamps is on, so FCS is locked out"
+      set fcserr = 9
+    else
+      set message = "comparison lamps $lamps are on, so FCS is locked out"
+      set fcserr = 10
+    endif
+    goto state_lockout
+  endif
+
+  # echo checkpt 3
+
+# For FCSMODE == 3, if the shutter is not already open, then we want to
+# command it open if, and only if, the following conditions are met:
+# 1. fcsmode == 3, AND
+# 2. No DEIMOS science exposure has been in progress (i.e., erasing,
+#    integrating, pausing, or reading out) within the last 15 seconds, AND
+# 3. The shutter has been closed for at least 15 seconds, AND
+# 4. No comparison lamps are on
+# 5. If in spectroscopic mode, a slitmask is inserted.
+# Note that prior to arriving at this point, we have already tested for
+# erasing, pausing, reading out, and for comparison lamps being on.
+# So we only need to test for the exposure in progress and the slitmask
+# insertion.
+# NOTE: Each cycle takes about 3 to 4seconds, so 7 cycles consumes 21 to 28s,
+# and 5 cycles takes between 15 to 20 seconds
+
+  if( ( $fcsmode       >= 3    ) && \
+      ( "$shutstat[1]" != open ) && \
+      ( "$lamps[1]"    == "Off") && \
+      ( $idle_timer    >  5) ) then
+
+    # echo we are inside the fcsmode=3 block
+    # echo slit mask insertion arm state is $slarmpos
+
+    if( $exposip_ctr) then
+    # echo pluggging gap between exposip and wcrate, exposip_ctr is $exposip_ctr
+      sleep 1
+      goto update_state
+    endif
+
+#   Are the conditions OK for opening the shutter?
+
+    # echo checkpt 3.1
+
+    if( ( (  $gratepos == 2 ) || \
+	  ( ($gratepos == 3 ) && ($g3tltnom == $g3tltnom_zero_order) ) || \
+          ( ("$slmsknam[1]" != "Unknown")  && \
+            ("$slmsknam[1]" != "None")     && \
+            ("$slmsknam[1]" != "Empty")    && \
+            ("$slarmpos[1]" == "inserted") ) ) ) then
+
+      # echo slitmask conditions are OK for opening shutter, zeroing fcsslbad
+      set fcsslbad = 0
+
+      # echo checkpt 3.2
+
+      if( $exposip == 0 ) then
+        set message = "fcsmode >= 3 is opening the shutter at `date`"
+        set fcserr = -44
+        echo "$message"
+        if( $fcserr != $last_fcserr) then
+ 	  modify -s deifcs nowait fcsmsg="$message"
+	  set last_fcserr = $fcserr
+        endif
+
+#       Repeat the command 3 times just in case the shutter is sticking
+        modify -s deiccd cshutter=open
+        modify -s deiccd cshutter=open
+        modify -s deiccd cshutter=open
+        if( $status ) then
+	  set message = "error commanding shutter open, retrying"
+	  set fcserr  = -45
+          goto state_emergency
+        endif
+
+        # echo checkpt 3.3
+
+        set idle_timer = 0
+#       Now refresh the shutter status variable
+        set shutstat = "`show -s deiccd -terse shutstat`"
+        if( $status ) then
+          set message = \
+         "error reading shutter status SHUTSTAT keyword from deiccd service"
+          set fcserr  = -40
+          goto state_emergency
+        endif
+        # echo shutter status is $shutstat at `date`
+      else
+        set message = \
+	  "Mode 3 did not open shutter because science exposure is in progress"
+        set fcserr = 29
+	echo $message
+        if( $fcserr != $last_fcserr) then
+ 	  modify -s deifcs nowait fcsmsg="$message"
+	  set last_fcserr = $fcserr
+        endif
+      endif
+    else
+      set fcsslbad = 1
+      set message = \
+        "Slit mask not inserted in spectroscopic mode, mode 3 idle"
+      set fcserr = -46
+      echo $message
+      if( $fcserr != $last_fcserr) then
+ 	modify -s deifcs nowait fcsmsg="$message"
+	set last_fcserr = $fcserr
+      endif
+    endif
+  else		# fcsmode < 3, shutstat == open, lamps on, or idle_timer <= 7
+    set fcsslbad = 0
+    # echo checkpt 3.4
+  endif
+
+  if( $last_fcsslbad != $fcsslbad ) then
+    echo fcsslbad just changed to $fcsslbad
+    modify -s deifcs nowait fcsslbad=$fcsslbad
+    set last_fcsslbad = $fcsslbad
+  endif
+
+  # echo checkpt 3.5
+#############################################################################
+# At this point we begin the processing that is common to FCS modes 2, 3, and 4
+#############################################################################
+
+  # echo checkpt 4
+
+  if( ( "$shutstat[1]" == "open" ) && \
+      ( ($exposip == 0) || ($remtime > 30) ) && \
+      ( "$gratepos" == "$snapargs[3]" ) && ( "$tiltwav" == "$snapargs[5]") && \
+      ( ($blink == 1) || ("$flamps[1]" == "$active_flamp") ) ) then
+
+        # echo checkpt 5
+
+        # Wait for any previous FCS exposures to finish reading out
+	waitfor -s deifcs -t 20 wcrate=f
+        if( $status ) then
+	  set message = "FCS keyword WCRATE true for more than 20 seconds"
+	  set fcserr  = -48
+	  goto state_emergency
+        endif
+
+        # echo checkpt 6
+
+        # Now wait for any previous FCS image to finish writing to disk
+        waitfor -s deifcs -t 15 wdisk=f
+        if( $status ) then
+          set message = \
+	   "FCS image did not finish writing to disk within 15 seconds"
+	  set fcserr = -49
+          goto state_emergency
+        endif
+
+        # echo checkpt 7
+
+	# Now that we are ready to start an FCS exposure, if we are in
+	# blink mode, turn on the appropriate FCS lamp as indicated in the
+	# reference file for this exposure
+
+	if( $blink ) then
+          # echo about to turn on $active_flamp lamp at `date`
+          modify -s deimot flamps=$active_flamp
+          if( $status ) then
+            set message = \
+	     "Error attempting to turn on FCS lamp $active_flamp, retrying"
+	    set fcserr = -50
+            goto state_emergency
+          endif
+	  set flamps=$active_flamp
+	# echo $active_flamp lamp turned on at `date`
+	endif
+
+        # echo checkpt 8
+
+        set exposip_before = $exposip
+
+        # We are about to commence FCS imaging
+        set fcstask = "Imaging"
+        modify -s deifcs nowait fcstask=$fcstask
+	set last_fcstask=$fcstask
+
+  	# Send notification of any changes in FCS STATE
+  	if( $last_fcsstate != $fcsstate ) then
+    	  echo fcsstate just changed from $last_fcsstate to $fcsstate
+    	  modify -s deifcs nowait fcsstate=$fcsstate
+    	  set last_fcsstate = $fcsstate
+  	endif
+
+        # Send notification of any changes in FCS TRACK
+        if( $last_fcstrack != $fcstrack ) then
+          echo fcstrack just changed from $last_fcstrack to $fcstrack
+          modify -s deifcs nowait fcstrack=$fcstrack
+          set last_fcstrack = $fcstrack
+        endif
+
+	# Re-compute master status
+  	if(       $fcsstate == 4 ) then
+    	  set fcssta = 6           # Red/Emergency
+  	else if(  $fcsstate == 3 ) then
+    	  set fcssta = 5           # Red/Lockout
+  	else if(  $fcstrack == 3 ) then
+    	  set fcssta = 4           # Red/Off-target
+  	else if( ($fcsstate == 0) && ($fcstrack == 2) ) then
+    	  set fcssta = 3           # Yellow/Seeking 
+#       else if( ($fcsstate == 2) && ($fcstrack == 0) ) then
+        else if(  $fcsstate == 2 ) then
+      	  set fcssta = 2           # Yelllow/Warning
+  	else if( ($fcsstate == 0) && ($fcstrack == 0) ) then
+     	  set fcssta = 1	   # Green/Tracking
+  	else if( ($fcsmode  == 0) || ($fcsmode  == 1) || \
+                 ($fcsstate == 1) || ($fcstrack == 1) ) then
+    	  set fcssta = 0	   # Grey/passive
+  	else
+    	  set fcssta = 6	   # When in doubt, sound the alarm
+  	endif
+
+  	# Send notification of any changes in FCS master STATUS
+  	if( $last_fcssta != $fcssta ) then
+    	  echo fcssta just changed from $last_fcssta to $fcssta
+    	  modify -s deifcs nowait fcssta=$fcssta
+    	  set last_fcssta = $fcssta
+  	endif
+
+	# echo about to start an FCS exposure at `date`
+	modify -s deifcs expose=t
+	if( $status ) then
+	   set message = "error attempting to start FCS exposure, retrying"
+	   set fcserr  = -53
+	   goto state_emergency
+	endif
+
+	# echo FCS exposure started at `date`
+	set message = "FCS exposure in progress"
+        set fcserr  = 11
+	# echo "$message"
+        if( $fcserr != $last_fcserr ) then
+	  modify -s deifcs nowait fcsmsg="$message"
+  	  set last_fcserr = $fcserr
+	endif
+  else
+   # echo gratepos is $gratepos and snapargs3 is $snapargs[3]
+   # echo tiltwav  is $tiltwav  and snapargs5 is $snapargs[5]
+   # echo flamps   is $flamps   and snapargs8 is $snapargs[8]
+   # echo checkpt 10
+
+   if( "$shutstat[1]" != "open" ) then
+	# echo checkpt 12
+	set message="Shutter is not open, FCS locked out"
+	set fcserr = 12
+   else if( ($exposip == 1) && ($remtime <= 30) ) then
+	# echo checkpt 13
+	set message="Not enough time left in science exposure, FCS locked out"
+	set fcserr = 13
+   else if( "$tiltwav[1]"  != "$snapargs[5]" ) then
+	# echo checkpt 14
+	set message="Grating tilt no longer matches reference, FCS locked out"
+	set fcserr = 14
+        set flush_pending = 1
+   else if( "$gratepos[1]" != "$snapargs[3]" ) then
+	# echo checkpt 15
+	set message="Grating no longer matches reference, FCS locked out"
+	set fcserr = 15
+	set flush_pending = 1
+	set fcsintxm = 0.0
+	set fcsintym = 0.0
+   else if( "$flamps[1]" != "$active_flamp") then
+	# echo checkpt 16
+ 	set message="FCS lamps no longer matches configuration, FCS locked out"
+ 	set fcserr = 16
+   else
+	# echo checkpt 17
+	set message="FCS is locked out"
+	set fcserr = 17
+   endif
+
+   # echo checkpt 18
+
+   set remtime = 0
+   goto state_lockout
+  endif
+
+# Wait for the next FCS exposure to end
+# But first, compute the amount of time we should be willing to wait,
+# which is the current FCS exposure time plus 10 seconds
+
+  # echo checkpt 20
+
+  @ expose_wait = $fcs_ttime + 10
+# echo waiting up to $expose_wait seconds for next FCS exposure to end at `date`
+  waitfor -s deifcs -t $expose_wait elaptime=$fcs_ttime
+  if( $status ) then
+    set message = "FCS exposure did not end within $expose_wait seconds"
+    set fcserr  = -54
+    goto emergency_ignore_image
+  endif
+
+  # echo FCS exposure ended at `date`
+
+# Grab state of science exposure status and shutter status command
+# We look at the shutter status command rather than the shutter status,
+# because there can be significant latency when reading the actual shutter
+# status from the utility board due to competion with the dewar temperature
+# control loop, which can tie up the utility board for up to 1.5 seconds
+
+  set deiccdkw = `show -s deiccd -terse -binary exposip cshutter`
+  if( $status ) then
+    echo error reading science exposip or cshutter keywords
+    #
+    # If we are unable to get current readings, then force success
+    # cshutter was read in binary mode.  "Open" status has value 1
+    set exposip_after = $exposip_before
+    set cshutter      = 1
+    set fcsstate      = 2 # WARNING
+  else
+    # echo deiccdkw $deiccdkw at `date`
+    set exposip_after = $deiccdkw[1]
+    set cshutter      = $deiccdkw[2]
+  endif
+
+  # echo checkpt 21
+
+  if( $blink == 0 ) then
+
+    # echo checkpt 22 
+    # Grab state of FCS lamps
+    set flamps = "`show -s deimot -terse flamps`"
+    if( $status ) then
+      set fcsstate = 2 # WARNING
+      set message = \
+        "error reading FCS lamp status FLAMPS keyword from deimot service"
+      set fcserr  = -55
+      if( $last_fcserr != $fcserr ) then
+	modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+	set last_fcserr = $fcserr
+      endif
+      set flamps = $active_flamp
+    endif
+
+    # echo FCS lamp state was $flamps at exposure end at `date`
+    # Check if the FCS lamps were turned off before the exposure ended
+
+    # echo checkpt 23
+
+    if( "$flamps" != "$active_flamp" ) then
+      set message="$flamps lamp turned off during FCS exposure, skipping"
+      set fcserr = -56
+      set idle_timer = 0
+      goto ignore_this_image
+    endif
+
+    # echo checkpt 24
+
+  else
+
+  # Since we are in blink mode, then turn off the FCS lamp so as to minimize
+  # FCS stray light on the science mosaic.
+
+    # echo about to turn off $active_flamp lamp at `date`
+
+    modify -s deimot flamps=Off
+    if( $status ) then
+      set message = "error turning off FCS lamp $active_flamp"
+      set fcserr  = -47
+      set fcsstate = 4 # EMERGENCY
+      if( $fcserr != $last_fcserr ) then
+	modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+	set last_fcserr = $fcserr
+      endif
+    else
+      echo FCS $active_flamp lamp turned off at `date`
+    endif
+  endif
+  
+  # echo checkpt 25
+
+# Check if a science exposure was started (or ended) during this FCS exposure
+# echo science exposip_before $exposip_before exposip_after $exposip_after
+  if( $exposip_after != $exposip_before ) then
+    set message = \
+"Science exposure changed from $exposip_before to $exposip_after during FCS exposure"
+    set fcserr = 18
+    goto ignore_this_image
+  endif
+
+  # echo checkpt 25
+
+# Now check if the exposure was of the intended length, or if was
+# terminated prematurely
+  set fcs_elaptime = `show -s deifcs -terse elaptime`
+  if( $status ) then
+    set message="error reading ELAPTIME keyword from FCS controller, retrying"
+    set fcserr = -57
+    goto emergency_ignore_image
+  endif
+
+  # echo checkpt 26
+
+  if( $fcs_elaptime != $snapargs[9] ) then
+    set message = \
+      "Incorrect FCS exposure length, was $fcs_elaptime s, not $snapargs[9] s"
+    set fcserr  = -58
+    goto ignore_this_image
+  endif
+
+  # echo checkpt 27
+
+# Wait for the next FCS exposure to start reading out
+  # echo waiting for next FCS image to start reading out at `date`
+  waitfor -s deifcs -t 10 wcrate=t
+  if( $status ) then
+    set message = \
+    "FCS readout did not begin within 10 seconds of end of exposure"
+    set fcserr  = -59
+    goto emergency_ignore_image
+  endif
+
+  set message = "FCS image is reading out"
+  set fcserr  = 19
+  # echo "FCS image is reading out at `date`"
+  if( $fcserr != $last_fcserr ) then
+    modify -s deifcs nowait fcsmsg="$message"
+    set last_fcserr = $fcserr
+  endif
+
+  # Check to make sure that the shutter is still open
+
+  if( "$cshutter" != "1" ) then
+    set message = \
+	"shutter was commanded closed during the FCS exposure, so ignore it"
+    set fcserr = 66
+    set idle_timer = 0
+    goto ignore_this_image
+  endif
+
+  # FCS exposure has ended and it appears to have been of the correct length.
+  # Now need to check if the spectrograph configuration changed during the
+  # course of this exposure, so get snapshot of current configuration
+
+  set deimotkw = \
+`show -s deimot -terse gratepos gratenam g3tltwav g4tltwav dwfilnam dwfocraw`
+
+  if( $status ) then
+    set message = "error reading gratings, tilts, filter, or focus"
+    set fcserr  = -67
+    goto emergency_ignore_image
+  endif
+
+  # echo deimotkw = $deimotkw at `date`
+
+  set end_gratepos = $deimotkw[1]
+  set end_gratenam = $deimotkw[2]
+  set g3tltwav     = $deimotkw[3]
+  set g4tltwav     = $deimotkw[4]
+  set end_dwfilnam = $deimotkw[5]
+  set end_dwfocraw = $deimotkw[6]
+
+  # Make sure that the configuration didn't change while the FCS image was
+  # integrating.  Otherwise, if it did, the FCS image could be garbage.
+  # 
+
+  if( $end_gratepos == 2 ) then
+    set end_tiltwav = 0.0
+  else if ( $end_gratepos == 3 ) then
+    set end_tiltwav = `/bin/printf "%011.6f" $g3tltwav`
+  else if ( $end_gratepos == 4 ) then
+    set end_tiltwav = `/bin/printf "%011.6f" $g4tltwav`
+  else
+    set message = "Slider came unclamped during FCS exposure"
+    set fcserr  =  68
+    set fcsintxm = 0.0
+    set fcsintym = 0.0
+    goto ignore_this_image
+  endif
+
+  if( ("$end_gratenam" != "$gratenam") || \
+      ("$end_gratepos" != "$gratepos") ) then
+    set message = "Slider/Grating changed during the FCS exposure"
+    set fcserr  =  69
+    set flush_pending = 1
+    set fcsintxm = 0.0
+    set fcsintym = 0.0
+    goto ignore_this_image
+  endif
+
+  if( "$end_tiltwav" != "$tiltwav" ) then
+    set message = "grating tilt changed during the FCS exposure"
+    set fcserr  =  70
+    set flush_pending = 1
+    goto ignore_this_image
+  endif
+
+  # Also need to check for changes in the filter or the focus
+
+  if( "$end_dwfilnam" == "Unknown" ) then
+    set message = "Science filter change in progress?"
+    set fcserr =  52
+    set flush_pending = 1
+    goto ignore_this_image
+  endif
+
+  if( "$end_dwfilnam" != "$dwfilnam" ) then
+    set message = "Filter changed during FCS exposure"
+    set fcserr =  71
+    set flush_pending = 1
+    goto ignore_this_image
+  endif
+
+  # Convert focus to an integer for threshold test
+  @ focuslow  = $dwfocraw[1] - $fcsfoto1
+  @ focushigh = $dwfocraw[1] + $fcsfoto1
+  set temp = `echo $end_dwfocraw | /usr/bin/sed "s/\./ /"`
+  set focus = $temp[1]
+
+  if( ($focus < $focuslow) || ($focus > $focushigh) ) then
+    set message = "focus changed during FCS exposure at `date`"
+    set fcserr  =  72
+    set conf_change = 1
+    set flush_pending = 1
+    goto ignore_this_image
+  endif
+
+  # If we get to here, the focus did not change during the exposure
+
+  # Shutter is still open and the FCS lamps are not turned off, and
+  # the readings for the grating, grating tilt wavelength, filter, and
+  # and focus are within tolerance of what they were at the start of 
+  # this exposure, so this is most likely a valid FCS exposure that
+  # should be analyzed. 
+
+  set idle_timer = 0
+
+  # Wait for the image to start writing to disk
+  waitfor -s deifcs -t 30 wdisk=t
+  if( $status ) then
+    set message = \
+     "FCS image did not start writing to disk within 30 seconds of exposure end"
+    set fcserr  = -73
+    goto emergency_ignore_image
+  endif
+
+  set message = "FCS image is writing to disk"
+  set fcserr  = 20
+  if( $fcserr != $last_fcserr ) then
+    modify -s deifcs nowait fcsmsg="$message"
+    set last_fcserr = $fcserr
+  endif
+
+  # Now check if either the filter or the focus changed during FCS readout.
+  # If either of these stages was in motion during FCS readout, then enough
+  # noise is injected into the image that bogus corrections can result.
+
+  set deimotkw = `show -s deimot -terse dwfilnam dwfocraw`
+
+  if( $status ) then
+    set message = "error reading filter or focus"
+    set fcserr  = -67
+    goto emergency_ignore_image
+  endif
+
+  # echo deimotkw = $deimotkw at `date`
+
+  set post_dwfilnam = $deimotkw[1]
+  set post_dwfocraw = $deimotkw[2]
+
+  # Is filter wheel now in motion?
+  if( "$post_dwfilnam" == "Unknown" ) then
+    set message = "Science filter change in progress?"
+    set fcserr =  52
+    set flush_pending = 1
+    goto ignore_this_image
+  endif
+
+  if( ("$post_dwfilnam" != "$dwfilnam") || \
+      ("$post_dwfilnam" != "$end_dwfilnam") ) then
+    set message = "Filter changed during FCS readout"
+    set fcserr =  171
+    set flush_pending = 1
+    goto ignore_this_image
+  endif
+
+  if( $post_dwfocraw[1] != $end_dwfocraw[1] ) then
+    set message = "focus changed during FCS readout at `date`"
+    set fcserr  =  172
+    set flush_pending = 1
+    goto ignore_this_image
+  endif
+
+  # Looks like this should be a clean and noise-free image, so process it
+
+  # If we get to here, then all of the various non-FCS stages
+  # that affect the FCS image (grating select, tilt, filter, focus)
+  # were stable during the exposure, and, in addition, the filter
+  # and focus stages were stable during the readout.  However, we
+  # still need to check if the current value of the focus matches
+  # the value on the previous iteration, just in case the focus was
+  # changed during the processing/correcting phase of the previous
+  # FCS cycle.
+
+  if( $post_dwfocraw[1] != $last_dwfocraw ) then
+    set message = \
+ "focus changed from $last_dwfocraw on last image to $post_dwfocraw on this one"
+    set fcserr = 151
+    if( $last_fcserr != $fcserr ) then
+      modify -s deifcs nowait fcsmsg="$message"
+      set last_fcserr = $fcserr
+    endif
+    echo $message
+    echo accept this image, but signal flush pending due to focus change
+    set flush_pending = 1
+    set last_dwfocraw = $post_dwfocraw[1]
+  endif
+
+  # Advance to the processing state
+  set fcstask="Processing"
+  modify -s deifcs nowait fcstask=$fcstask
+  set last_fcstask=$fcstask
+
+  # An allegedly valid FCS exposure has just started writing to disk
+  set deifcskw = `show -s deifcs -terse outdir outfile lframeno todisk`
+
+  if( $status ) then
+    set message = "Error reading FCS disk file keywords, skipping"
+    set fcserr  = -74
+    goto emergency_ignore_image
+  endif
+
+  # echo deifcskw $deifcskw at `date`
+
+  # Now construct the path to the file
+  set outdir   = $deifcskw[1]
+  set outfile  = $deifcskw[2]
+  set lframeno = $deifcskw[3]
+  set todisk   = $deifcskw[4]
+
+  set frameno = $lframeno
+
+  # echo outdir=  $outdir  
+  # echo outfile= $outfile
+  # echo frameno= $frameno 
+  # echo todisk= $todisk
+
+  # Pad with leading zeroes as needed
+  if ( $frameno < 10   )set frameno = "0"$frameno
+  if ( $frameno < 100  )set frameno = "0"$frameno
+  if ( $frameno < 1000 )set frameno = "0"$frameno
+  set filename = $outdir"/"$outfile$frameno.fits
+
+  if ( $todisk == false ) then
+	set filename = $outdir"/"backup.fits
+	echo will read from backup.fits
+  endif
+
+  # Now wait for the image to finish writing to disk
+  waitfor -s deifcs -t 15 wdisk=f
+  if( $status ) then
+    set message = "FCS image did not finish writing to disk within 15 seconds"
+    set fcserr  = -75
+    goto emergency_ignore_image
+  endif
+
+  # echo FCS image has finished writing to disk at `date`
+
+  set message = "FCS image has finished writing to disk"
+  set fcserr  = 21
+  if( $fcserr != $last_fcserr ) then
+    modify -s deifcs nowait fcsmsg="$message"
+    set last_fcserr = $fcserr
+  endif
+
+  if( (-e $filename) == 0 ) then
+    set message = "Expected FCS image file $filename does not exist"
+    set fcserr  = -76
+    goto emergency_ignore_image
+  endif
+
+  if( (-r $filename) == 0 ) then
+    set message = \
+	 "Account lacks read access to expected FCS image file $filename"
+    set fcserr = -77
+    goto emergency_ignore_image
+  endif
+
+  # Extract keywords from the FITS header for this image.
+  # If the keywords are missing, then try to read them from the live system.
+  # If we can't get the keywords from either the FITS header or the live
+  # system, then mark their respective values as unknown.
+
+  # echo about to extract rotatval
+  set rotatval = `head -1 $filename | fold -80 | fgrep ROTATVAL`
+  if( $#rotatval == 0) then
+      set message = \
+      "ROTATVAL keyword not found in FCS FITS header.  Reading from live system"
+      set fcserr = -78
+      set fcsstate = 2 # WARNING
+      if( $last_fcserr != $fcserr ) then
+	modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+	set last_fcserr = $fcserr
+      endif
+
+      set temp = `show -s deirot -terse rotatval`
+      if( $status ) then
+         set fcsstate = 2 # WARNING
+         set message = "Error reading ROTATVAL.  Forcing to unknown value"
+	 set fcserr  = -79
+         if( $last_fcserr != $fcserr ) then
+	   modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+	   set last_fcserr = $fcserr
+         endif
+	 set rotatval = (ROTATVAL= 999.999)
+      else
+         set rotatval = ("ROTATVAL=" $temp)
+      endif
+  endif
+
+  # echo about to extract gXtltnom
+  if( $gratepos == 2 ) then
+    set gXtltnom = (GXTLTNOM= 0)
+    set gXtltoff = (GXTLTOFF= 0)
+  else
+    set gXtltnom   = `head -1 $filename | fold -80 | fgrep "G"$gratepos"TLTNOM"`
+    if( $#gXtltnom == 0 ) then
+      set fcsstate = 2 # WARNING
+      set message = \
+   "G"$gratepos"TLTNOM" not found in FCS FITS header.  Reading from live system"
+      set fcserr  = -80
+      if( $last_fcserr != $fcserr ) then
+	modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+	set last_fcserr = $fcserr
+      endif
+
+      set temp = `show -s deimot -terse "g"$gratepos"tltnom"`
+      if( $status ) then
+         set fcsstate = 2 # WARNING
+         set message = \
+	 "Error reading "g"$gratepos"tltnom".  Forcing to unknown value"
+	 set fcserr  = -81
+         if( $last_fcserr != $fcserr ) then
+	   modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+	   set last_fcserr = $fcserr
+         endif
+         set gXtltnom = (GXTLTNOM= 999999)
+      else
+         set gXtltnom = ("GXTLTNOM=" $temp)
+      endif
+    endif
+
+    # echo about to extract gXtltoff
+    set gXtltoff   = `head -1 $filename | fold -80 | fgrep "G"$gratepos"TLTOFF"`
+    if( $#gXtltoff == 0 ) then
+      set fcsstate = 2 # WARNING
+      set message = \
+   "G"$gratepos"TLTOFF" not found in FCS FITS header.  Reading from live system"
+      set fcserr  = -82
+      if( $last_fcserr != $fcserr ) then
+	modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+	set last_fcserr = $fcserr
+      endif
+
+      set temp = `show -s deimot -terse "g"$gratepos"tltoff"`
+      if( $status ) then
+         set fcsstate = 2 # WARNING
+         set message = \
+	 "Error reading "g"$gratepos"tltoff".  Forcing to unknown value"
+	 set fcserr  = -83
+         if( $last_fcserr != $fcserr ) then
+	   modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+	   set last_fcserr = $fcserr
+         endif
+         set gXtltoff = (GXTLTOFF= 999999)
+      else
+         set gXtltoff = ("GXTLTOFF=" $temp)
+      endif
+    endif
+  endif
+
+  # echo about to extract tmirrraw
+  set tmirrraw = `head -1 $filename | fold -80 | fgrep TMIRRRAW`
+  if( $#tmirrraw == 0 ) then
+    set fcsstate = 2 # WARNING
+    set message = \
+	"TMIRRRAW not found in FCS FITS header.  Reading from live system."
+    set fcserr  = -84
+    if( $last_fcserr != $fcserr ) then
+      modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+      set last_fcserr = $fcserr
+    endif
+
+    set temp = `show -s deimot -terse tmirrraw`
+    if( $status ) then
+       set fcsstate = 2 # WARNING
+       set message = "Error reading tmirrraw.  Force to unknown value"
+       set fcserr  = -85
+       if( $last_fcserr != $fcserr ) then
+	 modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+	 set last_fcserr = $fcserr
+       endif
+       set tmirrraw = (TMIRRRAW= 999999)
+    else
+       set tmirrraw = ("TMIRRRAW=" $temp)
+    endif
+  endif
+
+  # echo about to extract dwxl8raw
+  set dwxl8raw = `head -1 $filename | fold -80 | fgrep DWXL8RAW`
+  if( $#dwxl8raw == 0 ) then
+    set fcsstate = 2 # WARNING
+    set message = \
+	 "DWXL8RAW not found in FCS FITS header.  Reading from live system."
+    set fcserr  = -86
+    if( $last_fcserr != $fcserr ) then
+      modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+      set last_fcserr = $fcserr
+    endif
+
+    set temp = `show -s deimot -terse dwxl8raw`
+    if( $status ) then
+       set fcsstate = 2 # WARNING
+       set message = "error reading dwxl8raw.  Forcing to unknown value"
+       set fcserr  = -87
+       if( $last_fcserr != $fcserr ) then
+	 modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+	 set last_fcserr = $fcserr
+       endif
+       set dwxl8raw = (dwxl8raw= 999999)
+    else
+       set dwxl8raw = ("DWXL8RAW=" $temp)
+    endif
+  endif
+
+  set hframeno = \
+      `head -1 $filename | fold -80 | fgrep FRAMENO | fgrep -v SFRAMENO`
+
+  # echo rotatval= $rotatval at `date`
+  # echo gXtltnom= $gXtltnom 
+  # echo gXtltoff= $gXtltoff
+  # echo tmirrraw= $tmirrraw
+  # echo dwxl8raw= $dwxl8raw
+  # echo hframeno= $hframeno[3] at `date`
+
+  if( $lframeno != $hframeno[3] ) then
+    set fcsstate = 2 # WARNING
+    set message = \
+	"LFRAMENO is $frameno but FRAMENO from FCS FITS header is $hframeno"
+    set fcserr  = -88
+    goto emergency_ignore_image
+  endif
+
+  set message =  "Processing FCS image file $filename"
+  set fcserr  =  22
+  if( $fcserr != $last_fcserr ) then
+    modify -s deifcs nowait fcsmsg="$message"
+    set last_fcserr = $fcserr
+  endif
+
+  # Build the script to send to VISTA
+  # echo about to build /tmp/scriptin.$$ at `date`
+
+  /bin/rm -f  /tmp/resultout.$$                     /tmp/scriptin.$$
+
+  echo "rd 1 $filename"                           > /tmp/scriptin.$$
+  echo "rd 2 $refilename"                        >> /tmp/scriptin.$$
+  echo "rp /local/u/kics/scripts/fcs_xcorr.pro"  >> /tmp/scriptin.$$
+
+if( $offline != 1 ) then
+# Do cross-correlation for CCD 1
+  echo "set base=0"                              >> /tmp/scriptin.$$
+  echo "go"                                      >> /tmp/scriptin.$$
+  echo "printf 'blank line'"                     >> /tmp/scriptin.$$
+  echo "printf 'XSHIFT1 %i4' xshift"             >> /tmp/scriptin.$$
+  echo "printf 'YSHIFT1 %i4' yshift"             >> /tmp/scriptin.$$
+  echo "printf 'XPOLYFIT1 %f11.6' xpolyfit"      >> /tmp/scriptin.$$
+  echo "printf 'YPOLYFIT1 %f11.6' ypolyfit"      >> /tmp/scriptin.$$
+
+# For debugging
+# echo "wd 3 $outdir/fcs.ccd1.cur.row.mash.fits" >> /tmp/scriptin.$$
+# echo "wd 4 $outdir/fcs.ccd1.cur.col.mash.fits" >> /tmp/scriptin.$$
+# echo "wd 5 $outdir/fcs.ccd1.ref.row.mash.fits" >> /tmp/scriptin.$$
+# echo "wd 6 $outdir/fcs.ccd1.ref.col.mash.fits" >> /tmp/scriptin.$$
+# echo "wd 7 $outdir/fcs.ccd1.crosscor.x.fits"   >> /tmp/scriptin.$$
+# echo "wd 8 $outdir/fcs.ccd1.crosscor.y.fits"   >> /tmp/scriptin.$$
+endif
+
+if( $offline != 2 ) then
+# Do cross-correlation for CCD 2
+  echo "set base=1200"                           >> /tmp/scriptin.$$
+  echo "go"                                      >> /tmp/scriptin.$$
+  echo "set yshift=-yshift"                      >> /tmp/scriptin.$$
+  echo "set ypolyfit=-ypolyfit"	                 >> /tmp/scriptin.$$
+  echo "printf 'blank line'"                     >> /tmp/scriptin.$$
+  echo "printf 'XSHIFT2 %i4' xshift"             >> /tmp/scriptin.$$
+  echo "printf 'YSHIFT2 %i4' yshift"             >> /tmp/scriptin.$$
+  echo "printf 'XPOLYFIT2 %f11.6' xpolyfit"      >> /tmp/scriptin.$$
+  echo "printf 'YPOLYFIT2 %f11.6' ypolyfit"      >> /tmp/scriptin.$$
+
+# For debugging
+# echo "wd 3 $outdir/fcs.ccd2.cur.row.mash.fits" >> /tmp/scriptin.$$
+# echo "wd 4 $outdir/fcs.ccd2.cur.col.mash.fits" >> /tmp/scriptin.$$
+# echo "wd 5 $outdir/fcs.ccd2.ref.row.mash.fits" >> /tmp/scriptin.$$
+# echo "wd 6 $outdir/fcs.ccd2.ref.col.mash.fits" >> /tmp/scriptin.$$
+# echo "wd 7 $outdir/fcs.ccd2.crosscor.x.fits"   >> /tmp/scriptin.$$
+# echo "wd 8 $outdir/fcs.ccd2.crosscor.y.fits"   >> /tmp/scriptin.$$
+endif
+
+  echo "rd 1 $filename"                          >> /tmp/scriptin.$$
+
+  # Get the mean background for CCD 1
+  echo "box 1 sr=10 sc=34 nr=10 nc=1180"         >> /tmp/scriptin.$$
+  echo "mn 1 box=1"                              >> /tmp/scriptin.$$
+  echo "set mnccd1=m1"				 >> /tmp/scriptin.$$
+
+  # Get the mean background for CCD 2
+  echo "box 2 sr=10 sc=1234 nr=10 nc=1180"       >> /tmp/scriptin.$$
+  echo "mn 1 box=2"                              >> /tmp/scriptin.$$
+  echo "set mnccd2=m1"	         		 >> /tmp/scriptin.$$
+
+  set ispot = 1
+  while( $ispot <= $nspot )
+
+     set crt = $cr[$ispot]
+     set cct = $cc[$ispot]
+
+     echo "box $ispot cr=$crt-yshift cc=$cct-xshift nr=$nr[$ispot] nc=$nc" \
+                                                           >> /tmp/scriptin.$$
+
+     echo "axes 1 box=$ispot sky=mnccd$ccd[$ispot] silent" >> /tmp/scriptin.$$
+
+     echo "printf 'blank line'"                            >> /tmp/scriptin.$$
+
+     echo \
+"printf 'CENTROID$ispot %F7.2 %F7.2 %F7.2 %F7.2 %F7.2' axc axr axcc axrr axrc"\
+                                                           >> /tmp/scriptin.$$
+
+     echo "abx  1 $ispot high=high total=total silent"     >> /tmp/scriptin.$$
+
+     echo "printf 'blank line'"                            >> /tmp/scriptin.$$
+     echo "printf 'PEAK$ispot %F9.2 %F12.2' high total"    >> /tmp/scriptin.$$
+
+     echo "set xcorrpix=$bx[$ispot]-axc"                   >> /tmp/scriptin.$$
+     echo "set ycorrpix=$by[$ispot]-axr"                   >> /tmp/scriptin.$$
+
+     echo "printf 'blank line'"				   >> /tmp/scriptin.$$
+     echo "printf 'FCSCORRX$ispot %F9.2' xcorrpix"         >> /tmp/scriptin.$$
+     echo "printf 'FCSCORRY$ispot %F9.2' ycorrpix"         >> /tmp/scriptin.$$
+
+     @ ispot = $ispot + 1
+  end
+  
+  echo "quit" >> /tmp/scriptin.$$
+  # echo done building at `date`
+
+  /local/kroot/bin/newvista < /tmp/scriptin.$$  >& /tmp/resultout.$$
+
+  set xshift=()
+  set yshift=()
+  set xpolyfit=()
+  set ypolyfit=()
+
+  if( $offline != 1 ) then
+    set temp   = `cat /tmp/resultout.$$ | fgrep XSHIFT1`
+  else
+    # If FCS CCD #1 is offline, then substitute result from FCS CCD #2
+    set temp   = `cat /tmp/resultout.$$ | fgrep XSHIFT2`
+  endif
+
+  if( $#temp >= 3 ) then
+     set xshift = ($xshift $temp[3])
+  endif
+
+  if( $offline != 2 ) then
+    set temp   = `cat /tmp/resultout.$$ | fgrep XSHIFT2`
+  else
+    # If FCS CCD #2 is offline, then substitute result from FCS CCD #1
+    set temp   = `cat /tmp/resultout.$$ | fgrep XSHIFT1`
+  endif
+
+  if( $#temp >= 3 ) then
+     set xshift = ($xshift $temp[3])
+  endif
+
+# echo xshift is $xshift at `date`
+
+  if( $offline != 1 ) then
+    set temp   = `cat /tmp/resultout.$$ | fgrep YSHIFT1`
+  else
+    # If FCS CCD #1 is offline, then substitute result from FCS CCD #2
+    set temp   = `cat /tmp/resultout.$$ | fgrep YSHIFT2`
+  endif
+
+  if( $#temp >= 3 ) then
+     set yshift = ($yshift $temp[3])
+  endif
+
+  if( $offline != 2 ) then
+    set temp   = `cat /tmp/resultout.$$ | fgrep YSHIFT2`
+  else
+    # If FCS CCD #2 is offline, then substitute result from FCS CCD #1
+    set temp   = `cat /tmp/resultout.$$ | fgrep YSHIFT1`
+  endif
+
+  if( $#temp >= 3 ) then
+     set yshift = ($yshift $temp[3])
+  endif
+# echo yshift is $yshift at `date`
+
+  if( ($#xshift < 2) || ($#yshift < 2) ) then
+    set message = \
+"X-correlation failed.  Image contrast too low or grating/slider misregistered"
+    set fcserr  = -89
+    goto emergency_ignore_image
+  endif
+
+  if( ($xshift[1] == -30) || ($xshift[2] == -30) || \
+      ($xshift[1] ==  30) || ($xshift[2] ==  30) || \
+      ($yshift[1] == -30) || ($yshift[2] == -30) || \
+      ($yshift[1] ==  30) || ($yshift[2] ==  30) ) then
+    # Cross-correlation failed.  Most likely cause is image is too faint.
+
+#############################################################################
+#
+#   DISABLE THIS BLOCK OF CODE FOR NOW UNTIL WE BETTER DEFINE THIS STRATEGY
+#   # BUT.... this could also result from a cosmic ray hit ....
+#   # We really need to discriminate between these two conditions
+#   # What we really need to do is check if there is any flux in this
+#   # image.  How do to that?  Histogram perhaps?
+#   # It might be too faint because a CuAr lamp just burned out.
+#   # Try switching to the other CuAr lamp if we are in spectral mode.
+#
+#   if( $flamps[1] == "Cu1" ) then
+#     set active_flamp = "Cu2"
+#   else if( $flamps[1] == "Cu2") then
+#     set active_flamp = "Cu1"
+#   endif
+#
+#   if( ( ($active_flamp[1] == "Cu1") || ($active_flamp == "Cu2") ) && \
+#       ($fcscusel[1] != $active_flamp[1]) ) then
+#     # Notify the outside world that the default CuAr lamp is being switched
+#     set fcscusel = $active_flamp
+#     modify -s deifcs nowait fcscusel=$fcscusel
+#     set message = \
+# "Cross correlation failed. FCS image too faint. Switching to $fcscusel lamp"
+#   else
+#     # Presumably we are in a direct imaging mode (either mirror or zero order)
+#     # and we are using the LED.  There is no backup for the LED is it dies.
+#   endif
+#############################################################################
+
+    set message = \
+"X-correlation failed.  Image contrast too low or grating/slider misregistered"
+    set fcserr  = -89
+    goto emergency_ignore_image
+  endif
+
+  if( $offline != 1 ) then
+    set temp    = `cat /tmp/resultout.$$ | fgrep XPOLYFIT1`
+  else
+    # If FCS CCD #1 is offline, then substitute result from FCS CCD #2
+    set temp    = `cat /tmp/resultout.$$ | fgrep XPOLYFIT2`
+  endif
+
+  if( $#temp >= 3 ) then
+    set xpolyfit = ($xpolyfit $temp[3])
+  endif
+
+  if( $offline != 2 ) then
+    set temp    = `cat /tmp/resultout.$$ | fgrep XPOLYFIT2`
+  else
+    # If FCS CCD #2 is offline, then substitute result from FCS CCD #1
+    set temp    = `cat /tmp/resultout.$$ | fgrep XPOLYFIT1`
+  endif
+
+  if( $#temp >= 3 ) then
+    set xpolyfit = ($xpolyfit $temp[3])
+  endif
+# echo xpolyfit is $xpolyfit at `date`
+
+  if( $offline != 1 ) then
+    set temp    = `cat /tmp/resultout.$$ | fgrep YPOLYFIT1`
+  else
+    # If FCS CCD #1 is offline, then substitute result from FCS CCD #2
+    set temp    = `cat /tmp/resultout.$$ | fgrep YPOLYFIT2`
+  endif
+
+  if( $#temp >= 3 ) then
+    set ypolyfit = ($ypolyfit $temp[3])
+  endif
+
+  if( $offline != 2 ) then
+    set temp    = `cat /tmp/resultout.$$ | fgrep YPOLYFIT2`
+  else
+    # If FCS CCD #2 is offline, then substitute result from FCS CCD #1
+    set temp    = `cat /tmp/resultout.$$ | fgrep YPOLYFIT1`
+  endif
+
+  if( $#temp >= 3 ) then
+    set ypolyfit = ($ypolyfit $temp[3])
+  endif
+# echo ypolyfit is $ypolyfit at `date`
+
+  # Now compute the means of each quantity
+  set xshift  = ($xshift  `echo "scale=2; ($xshift[1]+$xshift[2])  / 2.0" | bc`)
+  set yshift  = ($yshift  `echo "scale=2; ($yshift[1]+$yshift[2])  / 2.0" | bc`)
+
+  set xpolyfit = \
+	 ($xpolyfit `echo "scale=6; ($xpolyfit[1]+$xpolyfit[2]) /2.0" | bc`)
+  set ypolyfit = \
+	 ($ypolyfit `echo "scale=6; ($ypolyfit[1]+$ypolyfit[2]) /2.0" | bc`)
+
+  # echo after computing mean shifts and moments at `date`
+  # echo xshift  is $xshift
+  # echo yshift  is $yshift
+  # echo xpolyfit is $xpolyfit
+  # echo ypolyfit is $ypolyfit
+
+  # Compute the differences between the two CCDs
+
+  set fcscorxd = `echo "scale=6; $xpolyfit[1] - $xpolyfit[2]" | bc`
+  set fcscoryd = `echo "scale=6; $ypolyfit[1] - $ypolyfit[2]" | bc`
+
+  # Now that we have the corrections from the individual FCS CCDS and their
+  # differences, inform the rest of the world, since we may abort further
+  # processing of this image if there is a conflict between the two CCDs,
+  # and it would be good to have these intermediate products available
+  # externally in order to assess whether the rejection was reasonable
+
+  modify -s deifcs nowait fcscorx1=$xpolyfit[1] fcscory1=$ypolyfit[1] \
+  			  fcscorx2=$xpolyfit[2] fcscory2=$ypolyfit[2] \
+  			  fcscorxd=$fcscorxd fcscoryd=$fcscoryd
+
+#  Although this value is available here, we don't want to broadcast
+#  it to the outside world until AFTER we have decided whether or not
+#  to accept this frame.  Otherwise, we could plot on the GUI a point
+#  that we have decided to discard.
+#  modify -s deifcs nowait fcscorxm=$xpolyfit[3] fcscorym=$ypolyfit[3]
+
+  # First do a gross check for cosmic rays.  Reject any images in which there
+  # is a gross disagreement between the corrections generated for each axis
+  # (i.e., more than 3 pixels disagreement) between the two FCS CCDS
+
+  set cthr     = 6.0
+  set x_differ = $fcscorxd
+  set y_differ = $fcscoryd
+
+  # echo gross x_differ is $x_differ y_differ is $y_differ 
+  # echo gross cosmic ray threshold is $cthr
+
+  set x_conflict = \
+      `echo "scale=6;a=0;c=$x_differ;if(c>$cthr)a=1;if(c<-$cthr)a=1;a+0" | bc`
+  set y_conflict = \
+      `echo "scale=6;a=0;c=$y_differ;if(c>$cthr)a=1;if(c<-$cthr)a=1;a+0" | bc`
+
+  # echo gross x_conflict is $x_conflict y_conflict is $y_conflict
+
+  if( $x_conflict ) then
+      set message = \
+"FCS CCDS differ in X by $x_differ pixel, frame=$frameno, t= $cthr. Cosmic ray?"
+      set fcserr  = -190
+      goto ignore_ccnox
+  else
+      set fcsccnox = 0
+  endif
+
+  if( $y_conflict ) then
+      set message = \
+"FCS CCDS differ in Y by $y_differ pixel, frame=$frameno, t= $cthr. Cosmic ray?"
+      set fcserr  = -191
+      goto ignore_ccnoy
+  else
+      set fcsccnoy = 0
+  endif
+
+  # Now do a finer check for cosmic rays by looking at how the corrections
+  # from each FCS CCD have changed from the previous iteration to this
+  # iteration.
+  # However, we can only perform this check if the configuration on this
+  # iteration is the same as it was on the previous configuration.
+
+  if( $flush_pending == 1 ) then
+    # There was a configuration change just before this iteration.
+    # So we simply want to lag the current values for this iteration
+    foreach index ( 1 2 3 )
+        set last_xpoly[$index]  = $xpolyfit[$index]
+        set last_ypoly[$index]  = $ypolyfit[$index]
+    end
+
+    set message = \
+	"Tracking reference level re-established following configuration change"
+    echo $message at `date`
+    set fcserr = 150
+    if( $fcserr != $last_fcserr ) then
+      modify -s deifcs nowait fcsmsg="$message"
+      set last_fcserr = $fcserr
+    endif
+    # Now a new reference level is established, clear flush_pending flag
+    set flush_pending = 0
+  else
+    # There was no configuration change of flush pending, so we have a
+    # valid tracking reference level to which we can compare the
+    # X and Y corrections for the current iteration.
+    #
+    # First, check how much DEIMOS has rotated since the last iteration
+    set rotat_delta = `echo "scale=6;(($rotatval[2])-($last_rotatval))" | bc`
+    set rotat_slew  = \
+	  `echo "scale=6;a=0;c=$rotat_delta;if(c>4)a=1;if(c<-4)a=1;a+0" | bc`
+    set last_rotatval = $rotatval[2]
+    # echo rotat_delta is $rotat_delta and rotat_slew is $rotat_slew
+
+    if( $rotat_slew ) then
+      set message = \
+	"FCS senses DEIMOS rotation slew.  Rotated by $rotat_delta degrees"
+      echo "$message at `date`"
+      set fcserr = 160
+      if( $fcserr != $last_fcserr ) then
+        modify -s deifcs nowait fcsmsg="$message"
+        set last_fcserr = $fcserr
+      endif
+    endif
+
+    # Now compute the differences between the respective corrections for this
+    # iteration and those computed on the previous iteration
+    foreach index ( 1 2 3 )
+      set delta_xpoly[$index] = \
+	  `echo "scale=6;($xpolyfit[$index])-($last_xpoly[$index])" | bc`
+
+      set delta_ypoly[$index] = \
+	  `echo "scale=6;($ypolyfit[$index])-($last_ypoly[$index])" | bc`
+    end
+
+    # echo delta_xpoly is $delta_xpoly and delta_ypoly is $delta_ypoly
+
+    # Next compute the amounts by which the two FCS CCDs differ with respect
+    # to the changes in their respective corrections from the previous iteration
+    # to this iteration
+
+    set x_differ = `echo "scale=6;(($delta_xpoly[1])-($delta_xpoly[2]))" | bc`
+    set y_differ = `echo "scale=6;(($delta_ypoly[1])-($delta_ypoly[2]))" | bc`
+
+    # Now apply different thresholds depending on the magnitude of the position
+    # angle change between the current iteration and the previous iteration
+    if( $rotat_slew ) then
+      echo DEIMOS rotation is slewing or just slewed
+# jlyke
+      set cthr = 2.5
+#      set cthr = 6.0
+      #
+      set tempmin = `echo "a=0;if($x_differ < $x_slew_min)a=1;a+0" | bc`
+      set tempmax = `echo "a=0;if($x_differ > $x_slew_max)a=1;a+0" | bc`
+      #
+      if( $tempmin ) then
+        echo setting new x_slew_min of $x_differ
+        set x_slew_min = $x_differ
+      else if( $tempmax ) then
+        echo setting new x_slew_max of $x_differ
+        set x_slew_max = $x_differ
+      endif
+      #
+      set tempmin = `echo "a=0;if($y_differ < $y_slew_min)a=1;a+0" | bc`
+      set tempmax = `echo "a=0;if($y_differ > $y_slew_max)a=1;a+0" | bc`
+      #
+      if( $tempmin ) then
+        echo setting new y_slew_min of $y_differ
+        set y_slew_min = $y_differ
+      else if( $tempmax ) then
+        echo setting new y_slew_max of $y_differ
+        set y_slew_max = $y_differ
+      endif
+    else
+# jlyke
+      set cthr = 0.8
+#      set cthr = 6.0
+      #
+      set tempmin = `echo "a=0;if($x_differ < $x_track_min)a=1;a+0" | bc`
+      set tempmax = `echo "a=0;if($x_differ > $x_track_max)a=1;a+0" | bc`
+      #
+      if( $tempmin ) then
+        echo setting new x_track_min of $x_differ
+        set x_track_min = $x_differ
+      else if( $tempmax ) then
+        echo setting new x_track_max of $x_differ
+        set x_track_max = $x_differ
+      endif
+      #
+      set tempmin = `echo "a=0;if($y_differ < $y_track_min)a=1;a+0" | bc`
+      set tempmax = `echo "a=0;if($y_differ > $y_track_max)a=1;a+0" | bc`
+      #
+      if( $tempmin ) then
+        echo setting new y_track_min of $y_differ
+        set y_track_min = $y_differ
+      else if( $tempmax ) then
+        echo setting new y_track_max of $y_differ
+        set y_track_max = $y_differ
+      endif
+    endif
+
+    # echo x_differ is $x_differ y_differ is $y_differ 
+    # echo cosmic ray threshold is $cthr
+
+    set x_conflict = \
+	`echo "scale=6;a=0;c=$x_differ;if(c>$cthr)a=1;if(c<-$cthr)a=1;a+0" | bc`
+    set y_conflict = \
+	`echo "scale=6;a=0;c=$y_differ;if(c>$cthr)a=1;if(c<-$cthr)a=1;a+0" | bc`
+
+    # echo x_conflict is $x_conflict y_conflict is $y_conflict
+
+    if( $x_conflict ) then
+      set message = \
+"FCS CCDS differ in X by $x_differ pixel, frame=$frameno, t= $cthr. Cosmic ray?"
+      set fcserr  = -90
+      goto ignore_ccnox
+    else
+      set fcsccnox = 0
+    endif
+
+    if( $y_conflict ) then
+      set message = \
+"FCS CCDS differ in Y by $y_differ pixel, frame=$frameno, t= $cthr. Cosmic ray?"
+      set fcserr  = -91
+      goto ignore_ccnoy
+    else
+      set fcsccnoy = 0
+    endif
+
+    # Only lag the current values if there is no conflict in either axis
+    if( ($x_conflict == 0) && ($y_conflict == 0) ) then
+      foreach index ( 1 2 3 )
+        set last_xpoly[$index]  = $xpolyfit[$index]
+        set last_ypoly[$index]  = $ypolyfit[$index]
+      end
+    endif
+  endif
+
+  set centroidx = ()
+  set centroidy = ()
+  set sigmax    = ()
+  set sigmay    = ()
+  set eccentric = ()
+  set peaks     = ()
+  set totalcts  = ()
+  set fcscorrx  = ()
+  set fcscorry  = ()
+  set newx      = ()
+  set newy      = ()
+  set ispot = 1
+
+  while ( $ispot <= $nspot )
+
+    set temp = `cat /tmp/resultout.$$ | fgrep CENTROID$ispot`
+    if( ($#temp != 7) || \
+        ($temp[3] == "*******") || \
+        ($temp[4] == "*******") || \
+        ($temp[5] == "*******") || \
+        ($temp[6] == "*******") || \
+        ($temp[7] == "*******") ) then
+      set message = \
+	"Unable to find centroid for reference spot $ispot"
+      set fcserr  = -92
+      if( $fcserr != $last_fcswerr ) then
+        modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+        set last_fcserr = $fcserr
+      endif
+      set lastrefname = "no_centroid"
+      break
+    endif
+
+    set centroidx = ($centroidx $temp[3])
+    set centroidy = ($centroidy $temp[4])
+    set sigmax    = ($sigmax    $temp[5])
+    set sigmay    = ($sigmay    $temp[6])
+    set eccentric = ($eccentric $temp[7])
+
+    set temp = `cat /tmp/resultout.$$ | fgrep PEAK$ispot`
+    if( $#temp != 4 ) then
+      set message = \
+        "unable to find centroid for reference spot $ispot"
+      set fcserr  = -92
+      if( $fcserr != $last_fcswerr ) then
+        modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+        set last_fcserr = $fcserr
+      endif
+      set lastrefname = "no_peak"
+      break
+    endif
+
+    set peaks    = ($peaks     $temp[3])
+    set totalcts = ($totalcts  $temp[4])
+
+    set temp = `cat /tmp/resultout.$$ | fgrep FCSCORRX$ispot`
+    if( $#temp != 3 ) then
+      set message = \
+        "unable to find centroid for reference spot $ispot"
+      set fcserr  = -92
+      if( $fcserr != $last_fcswerr ) then
+        modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+        set last_fcserr = $fcserr
+      endif
+      set lastrefname = "no_fcscorrx"
+      break
+    endif
+    set fcscorrx = ($fcscorrx $temp[3])
+
+    set temp = `cat /tmp/resultout.$$ | fgrep FCSCORRY$ispot`
+    if( $#temp != 3 ) then
+      set message = \
+        "unable to find centroid for reference spot $ispot"
+      set fcserr  = -92
+      if( $fcserr != $last_fcswerr ) then
+        modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+        set last_fcserr = $fcserr
+      endif
+      set lastrefname = "no_fcscorry"
+      break
+    endif
+
+    set yc = $temp[3]
+    if( $ccd[$ispot] == 2 ) then
+        set yc = `echo "0 - $yc" | bc`
+    endif
+    set fcscorry = ($fcscorry $yc)
+
+    # Convert from VISTA coords back to figdisp coords for log file
+    # echo internal coordinates are x= $centroidx[$ispot]  y= $centroidy[$ispot]
+
+    # Convert back to coordinates consistent to those measured with figdisp
+    set temp = `echo "$centroidx[$ispot] -  24" | bc`
+    set newx = ($newx $temp)
+
+    set temp = `echo "$centroidy[$ispot] + 400" | bc`
+    set newy = ($newy $temp)
+
+    # echo $rotatval[2]
+    # echo $fcscorrx[$ispot]
+    # echo $fcscorry[$ispot]
+    # echo $newx[$ispot]
+    # echo $newy[$ispot]
+    # echo $sigmax[$ispot]
+    # echo $sigmay[$ispot]
+    # echo $eccentric[$ispot]
+    # echo $peaks[$ispot]
+    # echo $totalcts[$ispot]
+    # echo $gXtltnom[2]
+    # echo $tmirrraw[2]
+    # echo $dwxl8raw[2]
+    # echo $fcsmode
+    # echo $exposip
+    # echo $dwfilnam
+    # echo $dwfocraw
+
+    if( (-w $logname.$ispot) == 0 ) then
+      set message = \
+        "This account does not have write access to the spot $ispot log file"
+      set fcsstate = 2 # WARNING
+      set fcserr  = -39
+      if( $fcserr != $last_fcserr ) then
+        modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+        set last_fcserr = $fcserr
+      endif
+    else
+      set index=$ccd[$ispot]
+      echo `date` $frameno  $rotatval[2] \
+           $fcscorrx[$ispot]  $fcscorry[$ispot] \
+	   $xshift[$index] $yshift[$index] \
+           $newx[$ispot]  $newy[$ispot]  $sigmax[$ispot]  \
+           $sigmay[$ispot]  $eccentric[$ispot] \
+	   $peaks[$ispot]  $totalcts[$ispot]  $gXtltnom[2] \
+           $tmirrraw[2]  $dwxl8raw[2] $fcsmode $exposip \
+	   $dwfilnam  $dwfocraw >> $logname.$ispot
+    endif
+
+    @ ispot = $ispot + 1
+
+  end
+
+  # echo centroidx $centroidx at 'date'
+  # echo centroidy $centroidy
+  # echo sigmax $sigmax
+  # echo sigmay $sigmay
+  # echo eccentric $eccentric
+  # echo peaks $peaks
+  # echo totalcts $totalcts
+  # echo fcscorrx $fcscorrx
+  # echo fcscorry $fcscorry
+
+  if( $ispot <= $nspot ) then
+    set message = \
+     "fcstrack bailed out of the ispot loop when computing centroids"
+    set fcserr  = -93
+    goto ignore_this_image
+  endif
+
+  # We now have $nspot sets of corrections.  Calculate means & std deviations
+
+  set ispot = 1
+  set totalx = 0.0
+  set totaly = 0.0
+
+  # echo computing first totals at `date`
+  while ( $ispot <= $nspot )
+    set totalx = `echo "$totalx + $fcscorrx[$ispot]" | bc`
+    # echo mean totalx is $totalx
+    set totaly = `echo "$totaly + $fcscorry[$ispot]" | bc`
+    # echo mean totaly is $totaly
+    @ ispot = $ispot + 1
+  end
+
+  # echo computing means at `date`
+
+  if( $nspot > 0 ) then
+      set meanx = `echo "scale = 6; $totalx / $nspot.0" | bc`
+      set meany = `echo "scale = 6; $totaly / $nspot.0" | bc`
+  else
+      set meanx = 0.0
+      set meany = 0.0
+  endif
+
+  # echo meanx is $meanx
+  # echo meany is $meany
+
+  set ispot = 1
+  set totalx = 0.0
+  set totaly = 0.0
+
+  # echo computing second totals at `date`
+  while ( $ispot <= $nspot )
+   
+    set temp = " ( $fcscorrx[$ispot] - $meanx ) "
+    # echo temp for X summed squares is $temp
+    set totalx = `echo "$totalx + ($temp * $temp)" | bc`
+    # echo summed square total for X is $totalx
+
+    set temp = " ( $fcscorry[$ispot] - $meany ) "
+    # echo temp for Y summed squares is $temp
+    set totaly = `echo "$totaly + ($temp * $temp)" | bc`
+    # echo summed square total for Y is $totaly
+
+    @ ispot = $ispot + 1
+  end
+
+  # echo computing standard deviations at `date`
+  if( $nspot > 0 ) then
+      set stddevx = `echo "scale = 6; sqrt($totalx) / ($nspot.0 - 1.0)" | bc`
+      set stddevy = `echo "scale = 6; sqrt($totaly) / ($nspot.0 - 1.0)" | bc`
+
+      # echo fcscorrx = $fcscorrx
+      # echo fcscorrx mean = $meanx  stddev = $stddevx
+
+      # echo fcscorry = $fcscorry
+      # echo fcscorry mean = $meany  stddev = $stddevy
+
+  else
+      set stddevx = 0.0
+      set stddevy = 0.0
+      set meanx   = $xpolyfit[3]
+      set meany   = $ypolyfit[3]
+  endif 
+
+  # We have accepted this correction as valid, so now it is time to
+  # broadcast this result to the outside world.
+
+  # echo about to set fcscorxm to $meanx, fcscorym to $meany
+  modify -s deifcs nowait fcscorxm=$meanx fcscorym=$meany
+
+      ########################################################################
+      # Experimental predictive algorithm to estimate additional correction
+      # needed when tracking at rotator velocities near those encountered when
+      # the telescope is tracking through the keyhole
+
+      set fx = \
+	`echo "scale=6;a=0;if($meanx<1.0)a=1;b=0;if($meanx>-1.0)b=1;a+b" | bc`
+      # echo predictive fx is $fx
+
+      if( $fx == 2 ) then
+        # Meanx is > -1.0 and < 1.0
+        set gx = `echo "scale=6;a=0;if($meanx>0.2)a=1;a+0" | bc`
+        if( $gx ) then
+	  # The current meanx is >0.2 and <1.0.  
+	  # Increment integrator by 0.45 times meanx
+	  set x_integ = \
+           `echo "scale=6;a=$x_integ;if(a<0.5)a=a+(0.45*$meanx);a+0" | bc`
+          echo incremented x_integ to $x_integ for meanx of $meanx
+        else
+          # Current meanx is <= 0.2 and > -1.0
+          set hx = `echo "scale=6;a=0;if($meanx<-0.2)a=1;a+0" | bc`
+          if( $hx ) then
+            # Current meanx is < -0.2 and > -1.0.
+	    # Decrement integrator by 0.45 times meanx
+	    set x_integ = \
+             `echo "scale=6;a=$x_integ;if(a>-0.5)a=a+(0.45*$meanx);a+0" | bc`
+            echo decremented x_integ to $x_integ for meanx of $meanx
+          else
+            # Current meanx is >= -0.2 and <= 0.2
+	    # Hold integrator at current value, unless abs(x_integ) < 0.1,
+	    # in which case clip it to zero.
+	    set x_integ = `echo "scale=6;a=$x_integ;if(a*a<0.01)a=0;a+0" | bc`
+	    echo holding/clipping x_integ to $x_integ for meanx of $meanx
+          endif
+        endif
+      else
+        # Meanx is <= -1.0 or >= 1.0
+        set x_integ = 0.0
+        echo clamping x_integ to zero since meanx is $meanx
+      endif
+
+      # Now compute the adjusted meanx by adding in the x integration term
+      set adj_meanx = `echo "scale=6;$meanx+$x_integ" | bc`
+      # echo adjusted meanx is $adj_meanx for x_integ of $x_integ
+
+      # Now do something similar for the Y axis
+      set fy = \
+	`echo "scale=6;a=0;if($meany<1.0)a=1;b=0;if($meany>-1.0)b=1;a+b" | bc`
+      # echo predictive fy is $fy
+
+      if( $fy == 2 ) then
+        # Meany is > -1.0 and < 1.0
+        set gy = `echo "scale=6;a=0;if($meany>0.1)a=1;a+0" | bc`
+        if( $gy ) then
+	  # The current meany is >0.1 and <1.0.  
+	  # Increment integrator by 0.5 times meany
+	  set y_integ = \
+           `echo "scale=6;a=$y_integ;if(a<0.5)a=a+(0.5*$meany);a+0" | bc`
+          echo incremented y_integ to $y_integ for meany of $meany
+        else
+          # Current meany is <= 0.1 and > -1.0
+          set hy = `echo "scale=6;a=0;if($meany<-0.1)a=1;a+0" | bc`
+          if( $hy ) then
+            # Current meany is < -0.1 and > -1.0.
+	    # Decrement integrator by 0.5 times meany
+	    set y_integ = \
+             `echo "scale=6;a=$y_integ;if(a>-0.5)a=a+(0.5*$meany);a+0" | bc`
+            echo decremented y_integ to $y_integ for meany of $meany
+          else
+            # Current meany is >= -0.1 and <= 0.1
+	    # Hold integrator at current value, unless abs(y_integ) < 0.05,
+	    # in which case clip it to zero.
+	    set y_integ = `echo "scale=6;a=$y_integ;if(a*a<0.0025)a=0;a+0" | bc`
+	    echo holding/clipping y_integ to $y_integ for meany of $meany
+          endif
+        endif
+      else
+        # Meany is <= -1.0 or >= 1.0
+        set y_integ = 0.0
+        echo clamping y_integ to zero since meany is $meany
+      endif
+
+      # Now compute the adjusted meany by adding in the y integration term
+      set adj_meany = `echo "scale=6;$meany+$y_integ" | bc`
+      # echo adjusted meany is $adj_meany for y_integ of $y_integ
+      ########################################################################
+
+    modify -s deifcs nowait fcsintxm=$x_integ    fcsintym=$y_integ \
+                            fcsadjxm=$adj_meanx  fcsadjym=$adj_meany
+
+  if( $offline == 0 ) then
+    set max_padjust =  20
+    set max_nadjust = -20
+  else
+    set max_padjust =  5
+    set max_nadjust = -5
+  endif
+
+  # Check if the correction in X is excessive
+  set x_expos = `echo "scale=6;a=0;if($adj_meanx>$max_padjust)a=1;a+0" | bc`
+  set x_exmin = `echo "scale=6;a=0;if($adj_meanx<$max_nadjust)a=1;a+0" | bc`
+
+  if($x_expos || $x_exmin) then
+    if($fcsexnox == 0) then
+      set fcsexnox = -1
+      if($x_expos) then
+        set adj_meanx   = $max_padjust
+        set fcserr  = -105
+      else if($x_exmin) then
+        set adj_meanx   = $max_nadjust
+        set fcserr  = -106
+      endif
+      set fcsstate = 2 # WARNING
+      set message = "X correction exceeds $adj_meanx.  Clamping to $adj_meanx"
+      if( $last_fcserr != $fcserr ) then
+	modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+        set last_fcserr = $fcserr
+      endif
+    else 
+      if($fcsexnox == -1) then
+        set fcsexnox = 1
+      else
+        @ fcsexnox   = $fcsexnox + 1
+      endif
+      goto ignore_exnox
+    endif
+  else
+    set fcsexnox = 0
+  endif
+
+  # Check if the correction in Y is excessive
+  set y_expos = `echo "scale=6;a=0;if($adj_meany>$max_padjust)a=1;a+0" | bc`
+  set y_exmin = `echo "scale=6;a=0;if($adj_meany<$max_nadjust)a=1;a+0" | bc`
+
+  if($y_expos || $y_exmin) then
+    if($fcsexnoy == 0) then
+      set fcsexnoy = -1
+      if($y_expos) then
+        set adj_meany   = $max_padjust
+        set fcserr  = -105
+      else if($y_exmin) then
+        set adj_meany   = $max_nadjust
+        set fcserr  = -106
+      endif
+      set fcsstate = 2 # WARNING
+      set message = "Y correction exceeds $adj_meany.  Clamping to $adj_meany"
+      if( $last_fcserr != $fcserr ) then
+	modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+        set last_fcserr = $fcserr
+      endif
+    else 
+      if($fcsexnoy == -1) then
+        set fcsexnoy = 1
+      else
+        @ fcsexnoy   = $fcsexnoy + 1
+      endif
+      goto ignore_exnoy
+    endif
+  else
+    set fcsexnoy = 0
+  endif
+
+  # echo about to check peak values at `date`
+
+  set ispot = 1
+  set bad_peak = 0
+  while ( $ispot <= $nspot )
+
+    set temp = `echo $peaks[$ispot] | /usr/bin/sed "s/\./ /"`
+    set int_peak = $temp[1]
+#   echo int_peak is $int_peak
+
+    if(($int_peak > $peaklow[$ispot]) && ($int_peak < $peakhigh[$ispot])) then
+      echo spot $ispot peak value of $int_peak is within expected range
+    else
+      # echo "Invalid peak value $int_peak for spot $ispot at frame $frameno"
+      # echo low limit= $peaklow[$ispot]  high limit= $peakhigh[$ispot]
+      set message = \
+	"Centroid for spot $ispot found but peak count outside window"
+      set fcserr  = -94
+      if( $fcserr != $last_fcserr ) then
+        modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+        set last_fcserr = $fcserr
+      endif
+      set lastrefname = "invalid_peak"
+#     Don't attempt to correct if peak value is suspect
+      @ bad_peak = $bad_peak + 1
+    endif
+
+    @ ispot = $ispot + 1
+  end
+
+  # Compute corrections here, using the values set in fcscorrx and fcscorry
+  # But first make sure we don't have any unknown values
+
+  # First, compute corrections for dewar translation stage, which are
+  # independent of grating or mirror
+  if( $dwxl8raw[2] == 999999 ) then
+       set dwxl8trg = 999999
+  else
+    set dwxl8trg = `echo "$dwxl8raw[2] - ($adj_meany / 0.0096)" | bc`
+    # echo dwxl8trg is $dwxl8trg at `date`
+
+    # Check if the dewar translate stage position we are about to set
+    # will put the stage within 100 counts of either limit of travel
+    if( ($dwxl8trg < -2200) || ($dwxl8trg > 700) ) then
+      set fcsdxlim = 1
+      set fcsstate = 2 # WARNING
+    else
+      set fcsdxlim = 0
+    endif
+
+    # If state has changed, update the fcsdxlim keyword
+    if( $last_fcsdxlim != $fcsdxlim ) then
+      echo fcsdxlim just changed to $fcsdxlim
+      modify -s deifcs nowait fcsdxlim=$fcsdxlim
+      set last_fcsdxlim = $fcsdxlim
+    endif
+
+    # Now check if the stage position we are about to set would put
+    # the stage at or beyond a limit of travel.  If the latter, clamp
+    # the position command to the relevant limit of travel.
+
+    if( $dwxl8trg < -2300 ) then
+      set fcsstate = 4 # EMERGENCY
+      set message = "dewar translation stage negative limit reached"
+      set fcserr  = -95
+      if( $fcserr != $last_fcserr ) then
+        modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+        set last_fcserr = $fcserr
+      endif
+      set dwxl8trg = -2300
+    else if( $dwxl8trg > 800 ) then
+      set fcsstate = 4 # EMERGENCY
+      set message = "dewar translation stage positive limit reached"
+      set fcserr = -96
+      if( $fcserr != $last_fcserr ) then
+        modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+        set last_fcserr = $fcserr
+      endif
+      set dwxl8trg = 800
+    endif
+  endif
+
+  # Next, compute tent mirror corrections
+  if( $tmirrraw[2] == 999999 ) then
+      echo tent mirror position is unknown
+      set tmirrtrg = 999999
+      set gntltoff = 999999
+  else
+    # Compute correction purely in terms of tent mirror
+    set temp = `echo "$adj_meanx / $gain" | bc | /usr/bin/sed "s/\./ /"`
+    set tmirrcor = $temp[1]
+    # echo initial tmirrcor is $tmirrcor
+
+    # Now compute tent mirror (and possibly the tilt corrections)
+    if( ($gratepos == 3) || ($gratepos == 4) ) then
+
+      # echo computing tent mirror correction for grating
+      # Now check to see if tent mirror re-centering is needed
+      set tmthr = `echo "$tmirrraw[2] + $tmirrcor - 4709" | bc`
+      # echo tmthr is $tmthr
+
+      if( ($tmthr < -4200) || ($tmthr > 4200) ) then
+	 set message = "Tent mirror re-centering is needed"
+	 set fcserr  = 23
+	 if( $last_fcserr != $fcserr ) then
+	   modify -s deifcs nowait fcsmsg="$message"
+	   set last_fcserr = $fcserr
+	 endif
+         set rcpix = `echo "$tmthr * $gain" | bc`
+         # echo rcpix is $rcpix
+      
+         set temp     = `echo "$rcpix / 0.305" | bc | /usr/bin/sed "s/\./ /"`
+         set rctltdel =  $temp[1]
+         # echo rctltdel is $rctltdel
+
+         set rctltpix = `echo "$rctltdel * -0.305" | bc`
+         # echo rctltpix is $rctltpix
+
+         set rctmcor   = `echo "$rctltpix / $gain" | bc`
+         # echo rctmcor is $rctmcor
+
+         set tmirrcor = `echo "$tmirrcor + $rctmcor" | bc`
+         # echo adjusted tmirrcor is $tmirrcor
+      else
+        echo tent mirror re-centering is not needed
+	set rctltdel = 0
+      endif
+
+      if( $gXtltoff[2] == 999999 ) then
+        set gntltoff = 999999
+      else
+        set gntltoff = `echo "$gXtltoff[2] + $rctltdel" | bc`
+      endif
+    else
+      set gntltoff = 0
+    endif
+
+    # echo gntltoff is $gntltoff
+    if( ($gntltoff < -100) || ($gntltoff > 100) ) then
+      set fcsstate = 2 # WARNING
+      set fcsgtlim = 1
+    else
+      set fcsgtlim = 0
+    endif
+
+    if( $last_fcsgtlim != $fcsgtlim ) then
+      echo fcsgtlim just changed to $fcsgtlim
+      modify -s deifcs nowait fcsgtlim=$fcsgtlim
+      set last_fcsgtlim = $fcsgtlim
+    endif
+
+    set tmirrtrg = `echo "$tmirrcor + $tmirrraw[2]" | bc`
+    # echo tmirrtrg is $tmirrtrg at `date`
+
+    if( ($tmirrtrg < 500) || ($tmirrtrg > 8900) ) then
+      set fcsstate = 2 # WARNING
+      set fcstmlim = 1
+    else
+      set fcstmlim = 0
+    endif
+
+    if( $last_fcstmlim != $fcstmlim ) then
+      echo fcstmlim just changed to $fcstmlim
+      modify -s deifcs nowait fcstmlim=$fcstmlim
+      set last_fcstmlim = $fcstmlim
+    endif
+
+    # Need to check if we exceeded the range of motion of the tent mirror
+    if( $tmirrtrg < 10) then
+      set fcsstate = 4 # EMERGENCY
+      set message = "tent mirror travel low limit reached"
+      set fcserr  = -97
+      if( $fcserr != $last_fcserr ) then
+        modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+        set last_fcserr = $fcserr
+      endif
+      set tmirrtrg = 10
+    else if( $tmirrtrg > 9400 ) then
+      set fcsstate = 4 # EMERGENCY
+      set message = "tent mirror travel high limit reached"
+      set fcserr  = -98
+      if( $fcserr != $last_fcserr ) then
+        modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+        set last_fcserr = $fcserr
+      endif
+      set tmirrtrg = 9400
+    endif
+  endif
+
+  if( (-w $logname) == 0 ) then
+    set fcsstate = 2 # WARNING
+    set message = "This account does not have write access to the log file"
+    set fcserr = -39
+    if( $fcserr != $last_fcserr ) then
+      modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+      set last_fcserr = $fcserr
+    endif
+  else
+    echo `date` $frameno  $rotatval[2] \
+       $meanx  $meany \
+       $tmirrtrg  $dwxl8trg $gntltoff \
+       $stddevx $stddevy $xshift $yshift $xpolyfit $ypolyfit \
+       $gXtltnom[2] $tmirrraw[2]  $dwxl8raw[2] $fcsmode $exposip \
+       $dwfilnam  $dwfocraw >> $logname
+  endif
+
+  if( $bad_peak ) then
+    set message = \
+	"$bad_peak spots had peak counts outside of their nominal window"
+    set fcserr  = -99
+    goto ignore_this_image
+  endif
+
+  # We processed this image, so append its statistics to the RMS buffers
+  # and then compute the RMS statistics for this science exposure
+  set fcsrmsx1_sam = ($fcsrmsx1_sam $xpolyfit[1])
+  set fcsrmsx2_sam = ($fcsrmsx2_sam $xpolyfit[2])
+  set fcsrmsxm_sam = ($fcsrmsxm_sam $xpolyfit[3])
+  set fcsrmsxd_sam = ($fcsrmsxd_sam $fcscorxd)
+
+  set fcsrmsx1 = `/local/kroot/bin/compute_rms $fcsrmsx1_sam`
+  set fcsrmsx2 = `/local/kroot/bin/compute_rms $fcsrmsx2_sam`
+  set fcsrmsxm = `/local/kroot/bin/compute_rms $fcsrmsxm_sam`
+  set fcsrmsxd = `/local/kroot/bin/compute_rms $fcsrmsxd_sam`
+    
+  set fcsrmsy1_sam = ($fcsrmsy1_sam $ypolyfit[1])
+  set fcsrmsy2_sam = ($fcsrmsy2_sam $ypolyfit[2])
+  set fcsrmsym_sam = ($fcsrmsym_sam $ypolyfit[3])
+  set fcsrmsyd_sam = ($fcsrmsyd_sam $fcscoryd)
+
+  set fcsrmsy1 = `/local/kroot/bin/compute_rms $fcsrmsy1_sam`
+  set fcsrmsy2 = `/local/kroot/bin/compute_rms $fcsrmsy2_sam`
+  set fcsrmsym = `/local/kroot/bin/compute_rms $fcsrmsym_sam`
+  set fcsrmsyd = `/local/kroot/bin/compute_rms $fcsrmsyd_sam`
+
+  echo Sample count is $#fcsrmsx1_sam
+
+  modify -s deifcs nowait fcsrmsx1=$fcsrmsx1 fcsrmsy1=$fcsrmsy1 \
+                          fcsrmsx2=$fcsrmsx2 fcsrmsy2=$fcsrmsy2 \
+                          fcsrmsxm=$fcsrmsxm fcsrmsym=$fcsrmsym \
+                          fcsrmsxd=$fcsrmsxd fcsrmsyd=$fcsrmsyd
+
+# Check if the reference spot is within box size of the reference position.
+# If a science exposure is not yet in progress, then we will use a box size
+# (e.g., 0.5 pix) that is twice the normal size (e.g., 0.25 pix).  Once a
+# science exposure is in progess, then we enfore the more stringent size.
+# This modification was made in response to a request by Marc Davis (made in
+# his post-observing comments for May 2003) and seconded by Sandy Faber in June.
+  if( $exposip ) then
+    set m = 1
+  else
+    set m = 2
+  endif
+
+  set negboxx = "-"$fcsboxx
+  set negboxy = "-"$fcsboxy
+  set fxs = \
+  "a=0;if($meanx > ($negboxx * $m))a=1;b=0;if($meanx < ($fcsboxx * $m))b=1;a+b"
+
+  set fys = \
+  "a=0;if($meany > ($negboxy * $m))a=1;b=0;if($meany < ($fcsboxy * $m))b=1;a+b"
+
+# echo fxs is $fxs and fys is $fys
+
+  set fx=`echo "$fxs" | bc`
+  set fy=`echo "$fys" | bc`
+
+# echo fx threshold is $fx and fy threshold is $fy
+
+  if( ($fx == 2) && ($fy == 2) ) then
+    set fcstrack = 0	# Tracking
+    if( $exposip ) then
+      set message = \
+"FCS image now aligned within +/- $fcsboxx pixels in X and $fcsboxy pixels in Y"
+      set fcserr  = 24
+    endif
+  else
+  # Check if the reference spot is within 1.0 pixel of the reference position
+    set fxs = "a=0; if( $meanx > -1.0) a=1; b=0; if( $meanx <  1.0) b=1 ;a+b"
+    set fys = "a=0; if( $meany > -1.0) a=1; b=0; if( $meany <  1.0) b=1 ;a+b"
+    set gx=`echo "$fxs" | bc`
+    set gy=`echo "$fys" | bc`
+
+  # echo gx threshold is $gx and gy threshold is $gy
+
+    if( ($gx == 2) && ($gy == 2) ) then
+      set fcstrack = 2	# Seeking
+    else
+      set fcstrack = 3	# Off target
+    endif
+  endif
+
+  echo "$message"
+  if( $fcserr != $last_fcserr) then
+    modify -s deifcs nowait fcsmsg="$message"
+    set last_fcserr = $fcserr
+  endif
+
+  if( $fcsmode == 1 ) goto update_state
+
+# Check if the needed correction is less than 0.05 pixel.  If so, skip it.
+  set fxs = \
+      "a=0; if( $adj_meanx > -0.05) a=1; b=0; if( $adj_meanx < 0.05) b=1 ;a+b"
+
+  set fys = \
+      "a=0; if( $adj_meany > -0.05) a=1; b=0; if( $adj_meany < 0.05) b=1 ;a+b"
+
+# echo fxs is $fxs and fys is $fys
+
+  set fx=`echo "$fxs" | bc`
+  set fy=`echo "$fys" | bc`
+
+# echo fx threshold is $fx and fy threshold is $fy
+
+  if( ($fx != 2) || ($fy != 2) ) then
+
+    if( ($dwxl8trg == 999999) || \
+        ($tmirrtrg == 999999) || ($gntltoff == 999999) ) then
+      set message = "FCS correction not possible due to missing values"
+      set fcserr  = -100
+      set fcstrack = 1	# Not correcting
+      goto emergency_ignore_image
+    endif
+
+    set fcstask = "Correcting"
+    modify -s deifcs nowait fcstask=$fcstask
+    set last_fcstask = $fcstask
+
+    set message = "Applying FCS corrections"
+    set fcserr  = 25
+    echo $message
+    if( $fcserr != $last_fcserr ) then
+      modify -s deifcs nowait fcsmsg="$message"
+      set last_fcserr = $fcserr
+    endif
+
+    if( $fy != 2 ) then
+      # Start the dewar translate stage heading toward its target.
+      # We will re-command this as a move with wait later on
+# jlyke
+      modify -s deimot dwxl8raw=$dwxl8trg nowait
+#      modify -s deimot dwxl8raw=0 nowait
+    endif
+
+    # echo about to test gntltoff count $#gntltoff string $gntltoff
+
+    if( ($gntltoff[1] != $lastgntoff) && ($gratepos != 2) ) then
+      set message = "Recentering the tent-mirror"
+      set fcserr  = 26
+      echo $message
+      if( $fcserr != $last_fcserr ) then
+        modify -s deifcs nowait fcsmsg="$message"
+        set last_fcserr = $fcserr
+      endif
+
+      if( $exposip ) then
+        modify -s deiccd pause=t
+	if( $status ) then
+          set fcsstate = 4 # Emergency
+	  set message = \
+	     "Error pausing science exposure to re-center tent mirror"
+	  set fcserr  = -101
+	  echo $message
+	  if( $last_fcserr != $fcserr ) then
+	    modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+	    set last_fcserr = $fcserr
+	  endif
+	endif
+      endif
+
+      modify -s deimot "g"$gratepos"tltoff"=$gntltoff[1]
+      if( $status ) then
+        set fcsstate = 4 # Emergency
+	set message = \
+	   "Error adjusting grating tilt during tent mirror re-centering"
+	set fcserrr = -11
+	echo $message
+        if( $last_fcserr != $fcserr ) then
+	  modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+	  set last_fcserr = $fcserr
+	endif
+      endif
+
+      set message = "Grating tilt adjusted for tent mirror re-centering"
+      set fcserr  = 27
+      echo $message
+      if( $last_fcserr != $fcserr ) then
+          modify -s deifcs nowait fcsmsg="$message"
+          set last_fcserr = $fcserr
+      endif
+    endif
+
+    modify -s deimot tmirrraw=$tmirrtrg
+    if( $status ) then
+      set fcsstate = 4 # Emergency
+      set message = "Tent mirror failed to complete the commanded move"
+      set fcserr  = -10
+      echo $message
+      if( $last_fcserr != $fcserr ) then
+          modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+          set last_fcserr = $fcserr
+      endif
+    endif
+
+    if( ($gntltoff[1] != $lastgntoff) && ($gratepos != 2) ) then
+      if( $exposip ) then
+        modify -s deiccd resume=t
+	if( $status ) then
+          set fcsstate = 4 # Emergency
+	  set message = \
+	     "Error resuming science exposure after re-centering tent mirror"
+	  set fcserr  = -103
+	  echo $message
+	  if( $last_fcserr != $fcserr ) then
+	    modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+	    set last_fcserr = $fcserr
+	  endif
+	endif
+      endif
+      set lastgntoff = $gntltoff[1]
+    endif
+
+    # Since we previously commanded a "novwait" move of the dewar translate
+    # stage to this target, that should should already be at the target
+    # position.  The reason we recommand the move here in "wait" mode is
+    # to confirm that it actually arrived at the commanded target.
+    if( $fy != 2 ) then
+# jlyke
+      modify -s deimot dwxl8raw=$dwxl8trg
+#      modify -s deimot dwxl8raw=0 nowait
+      if( $status ) then
+        set fcsstate = 4 # Emergency
+        set message = \
+	  "Dewar translate stage failed to complete the commanded move"
+        set fcserr  = -11
+        echo $message
+        if( $last_fcserr != $fcserr ) then
+          modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+          set last_fcserr = $fcserr
+        endif
+      endif
+    endif
+
+    set message = "FCS corrections applied"
+    set fcserr  = 28
+    echo $message
+    if( $last_fcserr != $fcserr ) then
+      modify -s deifcs nowait fcsmsg="$message"
+      set last_fcserr = $fcserr
+    endif
+    # echo second lastgntoff is $lastgntoff
+  endif
+
+  if( ($fx == 2) && ($fy == 2) ) then
+    set howlong = 0
+    if( ( $fcsmode    ==  4 ) && \
+        ( "$cshutter" == "1") ) then
+      set message="fcsmode = 4 is closing the shutter at `date`"
+      set fcserr = -104
+      echo $message
+      if( $last_fcserr != $fcserr ) then
+ 	modify -s deifcs nowait fcsmsg="$message" fcserr=$fcserr
+	set last_fcserr = $fcserr
+      endif
+
+#     Repeat the command 3 times just in case the shutter is sticking
+      modify -s deiccd cshutter=close
+      modify -s deiccd cshutter=close
+      modify -s deiccd cshutter=close
+      if( $status ) then
+        set message = "error commanding shutter closed, retrying"
+        set fcserr  = -14
+	goto state_emergency
+      endif
+
+      set idle_timer = 0
+
+#     Now refresh the shutter status variable
+      set shutstat = `show -s deiccd -terse shutstat`
+      if( $status ) then
+        set message = \
+	  "error reading shutter status SHUTSTAT keyword, retrying"
+	set fcserr  = -40
+        goto status_emergency
+      endif
+
+      # echo shutter status is $shutstat at `date`
+    endif
+  endif
+
+  goto update_state

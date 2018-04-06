@@ -1,0 +1,227 @@
+import os
+import sys
+import ktl
+
+
+def abort(message, fcserr):
+    """
+    Prints error message and code then quits with exit status of 1
+
+    Arguments:
+        message -- the error message to print
+        fcserr -- the error code to print
+    """
+
+    print('fcszero aborting')
+    print('%s. Fcserr is %d' % (message, fcserr))
+    os.sys.exit(1)
+
+
+def check_keyword(service, keyword, message, fcserr):
+    """
+    Returns a keyword value if valid otherwise print errors and quit
+
+    Arguments:
+        service -- KTL service name
+        keyword -- KTL keyword name
+        message -- the error message to print
+        fcserr -- the error code to print
+    """
+
+    try:
+        value = ktl.cache(service, keyword).read()
+        return value
+    except:
+        print('fcszero aborting')
+        print('%s. Fcserr is %d' % (message, fcserr))
+        os.sys.exit(1)
+
+
+def modify_fcsmsg(note, error=0):
+    """Writes message and error to KTL keywords fcsmsg and fcserr
+
+    Arguments:
+        note -- message to write to fcsmsg
+
+    Keyword Arguments:
+        error -- error code to write to fcserr (default 0)
+    """
+
+    ktl.write('deifcs', 'fcsmsg', note)
+    ktl.write('deifcs', 'fcserr', error)
+
+
+def modify_keyword(service, keyword, value, message, fcserr):
+    """
+    Modifies keyword otherwise prints errors and exits
+
+    Arguments:
+        service -- KTL service name
+        keyword -- KTL keyword name
+        value -- value to write to keyword
+        message -- error message to print
+        fcserr -- error code to print
+    """
+
+    try:
+        ktl.write(service, keyword, value)
+    except:
+        print('fcs aborting')
+        print('%s %d' % (message, fcserr))
+        os.sys.exit(1)
+
+
+def new_reference(gpos):
+    """
+    Re-centers the given grating position slider
+
+    Arguments:
+        gpos -- grating position
+    """
+
+    if gpos == 3:
+        gtltoff = 'g3tltoff'
+        fcserr_tilt = -210
+        fcserr_zero = -211
+    else:
+        gtltoff = 'g4tltoff'
+        fcserr_tilt = -212
+        fcserr_zero = -213
+
+    check_keyword('deimot', gtltoff, 'Error reading slider %i tilt offset' % gpos, fcserr_tilt)
+    print('DEIMOS slider 3 tilt offset %s if not centered in its range' % gtltoff)
+    modify_fcsmsg('About to re-center the slider %i tilt by setting offset = 0' % gpos)
+    modify_keyword('deimot', gtltoff, 0, 'Error zeroing slider %i tilt offset' % gpos, fcserr_zero)
+
+
+def rotate_to_pa(gpos, lowPa, highPa):
+    """
+    Rotates to required position angle (PA)
+
+    Arguments:
+        gpos -- name of grating position
+        lowPA -- lower PA angle
+        highPA -- upper RA angle
+    """
+    if gpos == 2:
+	fcserr_rot = -207
+	rotpos = -5
+    else:
+	fcserr_rot = -209
+	rotpos = -30
+
+    if pa != lowPa and pa != highPa:
+        print('DEIMOS PA of %i is not centered on flexure curve for slider %i' % (pa, gpos))
+
+        if rotatlck[1] != "UNLOCKED":
+            if gpos == 2:
+                fcserr_rot = -206
+            else:
+                fcserr_rot = -208
+            modify_fcsmsg('Unable to rotate DEIMOS because rotator is locked', fcserr_rot)
+            abort('Unable to rotate DEIMOS because rotator is locked', fcserr_rot)
+        else:
+            print('About tor rotate DEIMOS to PA %i, slider %i center of flexure' % (rotpos, gpos))
+            modify_fcsmsg('About tor rotate DEIMOS to PA %i, slider %i center of flexure' % (rotpos, gpos))
+            modify_keyword('deirot', 'rotatval', rotpos, 'Error rotating DEIMOS to PA %i' % rotpos, fcserr_rot)
+    else:
+        print('DEIMOS is already at PA %i, slider %i center of flexure', (rotpos, gpos))
+
+# ---------------------------------------------#
+# Parse command line arguments                 #
+# ---------------------------------------------#
+
+if len(sys.argv) == 1:
+    mode = 'new'
+elif sys.argv[1] == 'new':
+    mode = 'new'
+elif sys.argv[1] == 'match':
+    mode = 'match'
+else:
+    abort('Usage: python fcszero [new | match]', -400)
+
+print('fcszero version 3.0 will operate with mode %s' % mode)
+
+# ---------------------------------------------#
+# Check state of FCSSTATE                      #
+# ---------------------------------------------#
+
+fcsstate = check_keyword('deifcs', 'fcsstate', 'Error reading FCSSTATE', -200)
+
+if fcsstate != 'idle':
+    abort("Can't configure for reference images because FCS is not idle", -220)
+
+# ---------------------------------------------#
+# Determine Grating Position                   #
+# ---------------------------------------------#
+
+gratepos = int(check_keyword('deimot', 'gratepos', 'Error reading GRATEPOS', -201))
+
+print('Slider %s is clamped in position' % gratepos)
+modify_fcsmsg('FCS about to configure DEIMOS for %s reference image' % mode)
+# sleep?
+
+# ---------------------------------------------#
+# Determine PA from ROTATVAL                   #
+# ---------------------------------------------#
+
+pa = int(float(check_keyword('deirot', 'rotatval', 'Error reading position angle', -202)))
+
+# ---------------------------------------------#
+# Get ROTATLCK                                 #
+# ---------------------------------------------#
+
+rotatlck = check_keyword('deirot', 'rotatlck', 'Error reading ROTATLCK', -203)
+
+if rotatlck[1] != "UNLOCKED":
+    print('warning: DEIMOS rotation system is locked')
+    modify_fcsmsg('DEIMOS rotation system is locked', -204)
+
+# ---------------------------------------------#
+# Modify rotatmod = pos                        #
+# ---------------------------------------------#
+
+modify_keyword('deirot', 'rotatmod', 'pos', 'Error setting rotator to pos', -205)
+
+# ---------------------------------------------#
+# Rotate to PA based on GRATEPOS               #
+# Re-center the slider if mode = new           #
+# ---------------------------------------------#
+
+if gratepos == 2:
+    rotate_to_pa(gratepos, -5, -365)
+elif gratepos == 3 or gratepos == 4:
+    rotate_to_pa(gratepos, -30, -390)
+    if mode == 'new':
+        new_reference(gratepos)
+else:
+    modify_fcsmsg('No slider clamped in place, so FCS cannot be zeroed')
+    abort("FCS can't be zeroed because a slider is not clamped down'", -214)
+
+# ---------------------------------------------#
+# Re-center tent mirror                        #
+# Re-center dewar translation                  #
+# ---------------------------------------------#
+if mode == 'new':
+
+    tmirr = int(check_keyword('deimot', 'tmirrval' 'Error reading tent mirror position', -215))
+
+    if tmirr != 45:
+        print('DEIMOS tent mirror position of %i not centered in its range' % tmirr)
+        modify_fcsmsg('Re-centering the tent mirror')
+        modify_keyword('deimot', 'tmirrcal', 45.0, 'Error re-centering tent mirror', -216)
+    else:
+        print('DEIMOS tent mirror position is already centered in its range')
+
+    dwx = int(check_keyword('deimot', 'dwx18raw', 'Error reading dewar X translation', -217))
+
+    if dwx < -755 or dwx > -745:
+        print('DEIMOS X translation stage value %i is not centered in its range' % dwx)
+        modify_fcsmsg('Re-centering the dewar translate stage')
+        modify_keyword('deimot', 'dwx18raw', -750, 'Error re-centering dewar translation', -218)
+    else:
+        print('DEIMOS dewar translation stage is already centered in its range')
+
+print('fcszero %s successful. You are now ready to take reference spots' % mode)
+modify_fcsmsg('fcszero $s successful. You are now ready to take reference images' % mode)
+os.sys.exit()
