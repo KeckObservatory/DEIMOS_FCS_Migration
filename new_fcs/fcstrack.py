@@ -45,8 +45,7 @@ respect to the original fcstrack cshell script:
 
 - Single-spot is not supported.  
 - Multi-spot is not supported.
-- Cross-correlation in VISTA has been replaced by built-in
-  cross-correlation in Python.
+- Cross-correlation in VISTA replaced by cross-correlation in Python.
 
 Example:
 
@@ -54,8 +53,8 @@ fcstrack
 
 Modification history:
 
-2017-Nov-17     CA     Original version based on the cshell script
-                       fcstrack by R. Kibrick (2005)
+2017-Nov-17     CAAI     Original version based on the cshell script
+                         fcstrack by R. Kibrick (2005)
 
 """
 
@@ -66,393 +65,15 @@ Modification history:
 ###########################
 
 import sys, os
+from pathlib import Path 
+import datetime as dt
+from time import strftime
 import ktl
 from random import randint
 import numpy as np
-from fcs_exceptions import *
+import fcs_exceptions
+import fcs_auxiliary
 from astropy.io import fits
-
-######################
-######################
-## Define constants ##
-######################
-######################
-
-FCS_CONFIG_FILE = 'fcsconfig.dat'
-
-#------------------------------------------------#
-# Define possible values of ennumerated keywords #
-#------------------------------------------------#
-
-FCSSTATE_LST = ['OK', 'idle', 'warning', 'lockout', 'emergency']
-FCSSTA_LST = ['Passive', 'Tracking', 'Warning', 'Seeking', 'Off_target', 'Lockout', 'Emergency']
-FCSMODE_LST = ['Off', 'Monitor', 'Emergency', 'Track', 'Calibrate']
-FCSTRACK_LST = ['on target', 'not correcting', 'seeking', 'off target']
-FCSTASK_LST = ['Idle', 'Imaging', 'Processing', 'Correcting']
-
-######################
-######################
-## Define functions ##
-######################
-######################
-
-#--------------------------#
-# Parse configuration file #
-#--------------------------#
-
-def parseConfigFile():
-
-    """
-    Read configuration file, parse content
-    and create a dictionary with the file content.
-    """
-
-    f = open(FCS_CONFIG_FILE, 'r')
-    data = f.readlines()
-    f.close()
-    
-    param_set = {}
-    
-    for line in data:
-        
-        if ( len(line.strip()) != 0 ):
-
-            if ( line.strip()[0] != '#' ):
-
-                key = line.strip().split('=')[0].strip()
-                value = line.strip().split('=')[1].strip()
-
-                param_set[key] = value
-
-    return param_set
-
-
-##################
-##################
-## Main program ##
-##################
-##################
-
-#--------------------------------------------#
-# Load configuration from fcsconfig.dat file #
-#--------------------------------------------#
-
-config = parseConfigFile()
-
-print (config)
-
-# Define which FCS CCD is offline
-
-OFFLINE = int(config['OFFLINE'])
-
-# Set blinking mode
-
-BLINK = int(config['BLINK'])
-
-# Set FCS detector configuration
-
-WINDOW_CFG = config['WINODW']
-BINNING_CFG = config['BINNING']
-AUTOSHUT_CFG = config['AUTOSHUT']
-
-# Set additional FCS parameters
-
-FCSFOTO1_CFG = config['FCSFOTO1'] 
-FCSFOTO2_CFG = config['FCSFOTO2']
-FCSCUSEL_CFG = config['FCSCUSEL']
-FCSBOXX_CFG = config['FCSBOXX']
-FCSBOXY_CFG = config['FCSBOXY'] 
-
-# Set roator value and tolerance for the slider 2 center of flexure 
-
-ROTATOR_CENTER_OF_FLEXURE = [float(config['SLIDER2_FLEXURE_CENTER']), \
-                             float(config['SLIDER3_FLEXURE_CENTER']), \
-                             float(config['SLIDER4_FLEXURE_CENTER'])]
-ROTATOR_CENTER_OF_FLEXURE_TOL = \
-[float(config['SLIDER2_FLEXURE_CENTER_DELTA']), \
- float(config['SLIDER3_FLEXURE_CENTER_DELTA']), \
- float(config['SLIDER4_FLEXURE_CENTER_DELTA'])]
-
-# Tent mirror central position and tolerance
-
-TENT_MIRROR_CENTER = float(config['TENT_MIRROR_CENTER'])
-TENT_MIRROR_CENTER_TOL = float(config['TENT_MIRROR_CENTER_DELTA'])
-
-# Dewar X translation stage center and tolerance
-
-DEWAR_TRANSLATION_STAGE_CENTER = float(config['DEWAR_TRANSLATION_STAGE_CENTER'])
-DEWAR_TRANSLATION_STAGE_CENTER_TOL = float(config['DEWAR_TRANSLATION_STAGE_CENTER_DELTA'])
-
-# Number of significant decimal digits to define the
-# central wavelength
-
-CENTRAL_WAVELENGTH_ACCURACY = int(config['CENTRAL_WAVELENGTH_ACCURACY'])
-
-# Central wavelength margin error
-
-CENTRAL_WAVELENGTH_DELTA = int(config['CENTRAL_WAVELENGTH_DELTA'])
-
-# FCS minimum and maximum exposure time
-
-FCS_MIN_EXPTIME = int(config['FCS_MIN_EXPTIME'])
-FCS_MAX_EXPTIME = int(config['FCS_MAX_EXPTIME'])
-
-# List of valid grating positions (sliders)
-
-VALID_GRATING_POS = config['VALID_GRATING_POSITIONS'].split(',')
-
-# List of valid grating names
-
-VALID_GRATING_NAM = config['VALID_GRATING_NAMES'].split(',')
-NUMBER_OF_VALID_OPTICAL_ELEMENTS = len(VALID_GRATING_NAM))
-
-# Optical model coefficients
-
-OMODEL_PARS = {config['MODEL1_NAME']: \
-               [float64(config['MODEL1_SCALE']), float(config['MODEL1_ZERO']), \
-                float(config['MODEL1_OFFSET'])], config['MODEL2_NAME']: \
-               [float64(config['MODEL2_SCALE']), float(config['MODEL2_ZERO']), \
-                float(config['MODEL2_OFFSET'])], config['MODEL3_NAME']: \
-               [float64(config['MODEL3_SCALE']), float(config['MODEL3_ZERO']), \
-                float(config['MODEL3_OFFSET'])], config['MODEL4_NAME']: \
-               [float64(config['MODEL4_SCALE']), float(config['MODEL4_ZERO']), \
-                float(config['MODEL4_OFFSET'])], config['MODEL5_NAME']: \
-               [float64(config['MODEL5_SCALE']), float(config['MODEL5_ZERO']), \
-                float(config['MODEL5_OFFSET'])], config['MODEL6_NAME']: \
-               [float64(config['MODEL6_SCALE']), float(config['MODEL6_ZERO']), \
-                float(config['MODEL6_OFFSET'])]}
-
-#----------------------------------#
-# Connect to keyword services,     #
-# monitor keywords and check that  #
-# the current configuration is     #
-# adequate to take a reference     #
-# frame.                           #
-#----------------------------------#
-
-deimot = ktl.cache('deimot')
-deirot = ktl.cache('deirot')
-deifcs = ktl.cache('deifcs')
-deiccd = ktl.cache('deiccd')
-
-# Monitor grating name
-
-gratenam = deimot['GRATENAM']
-gratenam.monitor()
-if ( gratenam not in VALID_GRATING_NAM ):
-    raise InvalidGratingName(gratenam)
-
-# Monitor slider position
-
-gratepos = deimot['GRATEPOS']
-gratepos.monitor()
-if ( gratepos not in VALID_GRATING_POS ):
-    raise InvalidSliderPosition(gratepos)
-
-# Monitor grating central wavelength
-
-if ( gratepos == 2 ):
-    tltwav = 0.0
-else:
-    grtltwav = deimot['G'+str(gratepos)+'TLTWAV']
-    grtltwav.monitor()
-    tltwav = grtltwav
-
-# Round the wavelength to the number of significant
-# digits defined in the configuration file
-
-wavel = np.around(float(tltwav), \
-                  decimals=int(config['CENTRAL_WAVELENGTH_ACCURACY']))
-
-
-# Monitor filer name
-
-dwfilnam = deimot['DWFILNAM']
-dwfilnam.monitor()
-
-# Monitor rotator value
-
-rotatval = deirot['ROTATVAL']
-rotatval.monitor()
-
-# Monitor the FCS output directory
-
-outdir = deifcs['OUTDIR']
-outdir.monitor()
-
-output_dir = '/s'+str(outdir)
-
-# OVERRIDES output directory for testing purposes.
-
-output_dir = '/home/calvarez/Work/scripts/deimos/test_data'
-
-os.chdir(output_dir)
-
-# Monitor FCS operating mode
-
-fcsmod = deifcs['FCSMODE']
-fcsmod.monitor()
-
-# Monitor FCS error
-
-external_fcserr = deifcs['FCSERR']
-external_fcserr.monitor()
-
-# Monitor selected Cu lamp
-
-fcscusel = deifcs['FCSCUSEL']
-fcscusel.monitor()
-
-# Monitor various FCS status and state variables
-
-# FCSSTATE: Possible values are: 
-#
-# 0 --> OK
-# 1 --> idle
-# 2 --> warning
-# 3 --> lockout
-# 4 --> emergency
-
-fcsstate = deifcs['FCSSTATE']
-fcsstate.monitor()
-
-# FCSSTA: Possible values are:
-#
-# 0 --> Passive
-# 1 --> Tracking
-# 2 --> Warning
-# 3 --> Seeking
-# 4 --> Off_target
-# 5 --> Lockout
-# 6 --> Emergency
-
-fcssta = deifcs['FCSSTA']
-fcssta.monitor()
-
-# FCSMODE: Possible values are:
-#
-# 0 --> Off
-# 1 --> Monitor
-# 2 --> Engineering
-# 3 --> Track
-# 4 --> Calibrate
-
-fcsmode = deifcs['FCSMODE']
-fcsmode.monitor()
-
-# FCSTRACK: Possible values are:
-#
-# 0 --> on target
-# 1 --> not correcting
-# 2 --> seeking
-# 3 --> off target
-
-fcstrack = deifcs['FCSTRACK']
-fcstrack.monitor()
-
-# FCSTASK: Possible values are:
-#
-# 0 --> Idle
-# 1 --> Imaging
-# 2 --> Processing
-# 3 --> Correcting
-
-fcstask = deifcs['FCSTASK']
-fcstask.monitor()
-
-# FCSSKIPS, FCSCCNOX/Y, FCSEXNOX/Y, FCSHBEAT
-
-fcsskips = deifcs['FCSSKIPS']
-fcsskips.monitor()
-
-fcsccnox = deifcs['FCSCCNOX']
-fcsccnox.monitor()
-
-fcsccnoy = deifcs['FCSCCNOY']
-fcsccnoy.monitor()
-
-fcsexnox = deifcs['FCSEXNOX']
-fcsexnox.monitor()
-
-fcsexnoy = deifcs['FCSEXNOY']
-fcsexnoy.monitor()
-
-fcshbeat = deifcs['FCSHBEAT']
-fcshbeat.monitor()
-
-# Monitor FCS detector configuration
-
-window = deifcs['WINDOW']
-window.monitor()
-
-binning = deifcs['BINNING']
-binning.monitor()
-
-autoshut = deifcs['AUTOSHUT']
-autoshut.monitor()
-
-# Monitor additional FCS keywords
-
-fcsfoto1 = deifcs['FCSFOTO1']
-fcsfoto1.monitor()
-
-fcsfoto2 = deifcs['FCSFOTO2']
-fcsfoto2.monitor()
-
-fcscusel = deifcs['FCSCUSEL']
-fcscusel.monitor()
-
-fcsboxx = deifcs['FCSBOXX']
-fcsboxx.monitor()
-
-fcsboxy = deifcs['FCSBOXY']
-fcsboxy.monitor()
-
-#-----------------------------#
-# Initialize control keywords #
-#-----------------------------#
-
-fcsslbad = 0
-fcsetmis = 0
-fcslamis = 0
-fcsfomis = 0
-fcstmlim = 0
-fcsdxlim = 0
-fcsdymin = 0
-fcsnogra = 0
-fcsnosli = 0
-fcsnowav = 0
-fcsnofil = 0
-fcsnofoc = 0
-
-x_integ = 0
-y_integ = 0
-
-x_track_min =  999.999
-x_track_max = -999.999
-y_track_min =  999.999
-y_track_max = -999.999
-
-x_slew_min =  999.999
-x_slew_max = -999.999
-y_slew_min =  999.999
-y_slew_max = -999.999
-
-clear_pending = 0
-
-window.write(WINDOW_CFG)
-binning.write(BINNING_CFG)
-autoshut.write(AUTOSHUT_CFG)
-
-fcsfoto1.write('FCSFOTO1_CFG')
-fcsfoto1.write('FCSFOTO2_CFG')
-
-fcscusel.write('FCSCUSEL_CFG')
-active_flamp = 'none'
-
-fcsboxx.write('FCSBOXX_CFG')
-fcsboxy.write('FCSBOXY_CFG')
-
 
 #######################
 #######################
@@ -460,71 +81,868 @@ fcsboxy.write('FCSBOXY_CFG')
 #######################
 #######################
 
-while ( fcsstate == 'ok' ):
+def main(config, control_variables):
 
-#------------------#
-# Check FCS status #
-#------------------#
+    while True:
 
-#---------------------#
-# DEIMOS sanity check #
-#---------------------#
+        #------------------------------------#
+        # Check communications with services #
+        #------------------------------------#
 
-#-------------------#
-# Take an FCS image #
-#-------------------#
+        control_variables = checkCommunications(control_variables)
 
-#-----------------------------#
-# Calculate cross-correlation #
-#-----------------------------#
+        #------------------#
+        # Update FCS state #
+        #------------------#
 
-#-------------------------#
-# Move stages as required #
-#-------------------------#
+        control_variables = updateState(config, control_variables)
+
+        #---------------------#
+        # DEIMOS sanity check #
+        #---------------------#
+
+        control_variables = checkSanity(config, control_variables)
+        
+        #---------------------------#
+        # Search FCS reference file #
+        #---------------------------#
+        
+        fcs_ref_image, control_variables = searchFcsRefImage(config, control_variables)
+
+        #-------------------#
+        # Take an FCS image #
+        #-------------------#
+        
+        fcs_image, control_variables = takeFcsImage(config, control_variables)
+
+        #-----------------------------#
+        # Calculate cross-correlation #
+        #-----------------------------#
+
+        results, control_variables = calculateXcorr(config, control_variables, fcs_image, fcs_ref_image)
+
+        #-------------------------#
+        # Move stages as required #
+        #-------------------------#
+
+        control_variables = moveStages(config, control_variables, results)
 
 
+######################
+######################
+## Define functions ##
+######################
+######################
+
+def initializeControlLoop(config):
+
+    """
+    - Connect to keyword services and monitor keywords
+    - Initialize configuration keywords
+    - Initialize control loop variables
+    """
+    
+    #---------------------------------#
+    # Connect to keyword services and #
+    # and monitor keywords.           #
+    #---------------------------------#
+
+    fcsmsg = ktl.cache('deifcs', 'FCSMSG')
+    fcsmsg.monitor()
+    fcserr = ktl.cache('deifcs', 'FCSERR')
+    fcserr.monitor()
+
+    # Announce that we are starting up
+
+    msg = 'fcstrack Version ' + str(fcs_auxiliary.VERSION) + ' starting at ' + str(dt.datetime.now()) + \
+          ' with offline = ' + str('%1d' % config['OFFLINE'])
+    fcs_auxiliary.logMessage(msg)
+
+    # Monitor grating name
+    
+    gratenam = ktl.cache('deimot', 'GRATENAM')
+    gratenam.monitor()
+
+    # Monitor slider position
+    
+    gratepos = ktl.cache('deimot', 'GRATEPOS')
+    gratepos.monitor()
+        
+    # Monitor filter name
+
+    dwfilnam = ktl.cache('deimot', 'DWFILNAM')
+    dwfilnam.monitor()
+
+    # Monitor rotator value
+
+    rotatval = ktl.cache('deirot', 'ROTATVAL')
+    rotatval.monitor()
+
+    # Monitor the FCS output directory
+
+    outdir = ktl.cache('deifcs', 'OUTDIR')
+    outdir.monitor()
+
+    # Monitor FCS operation mode
+
+    fcsmod = ktl.cache('deifcs', 'FCSMODE')
+    fcsmod.monitor()
+
+    # Monitor FCS error
+    
+    fcserr = ktl.cache('deifcs', 'FCSERR')
+    fcserr.monitor()
+
+    # Monitor selected Cu lamp
+
+    fcscusel = ktl.cache('deifcs', 'FCSCUSEL')
+    fcscusel.monitor()
+
+    # Monior FCS lamps status
+
+    flamps = ktl.cache('deimot', 'FLAMPS')
+    flamps.monitor()
+    
+    # Monitor the FCS filename keywords
+
+    fcsreffi = ktl.cache('deifcs', 'FCSREFFI')
+    fcsreffi.monitor()
+    fcsimgfi = ktl.cache('deifcs', 'FCSIMGFI')
+    fcsimgfi.monitor()
+    fcslogfi = ktl.cache('deifcs', 'FCSLOGFI')
+    fcslogfi.monitor()
+    
+    # Monitor FCS X-correlation keywords
+
+    fcsintxm = ktl.cache('deifcs', 'FCSINTXM')
+    fcsintxm.monitor()
+    fcsintym = ktl.cache('deifcs', 'FCSINTYM')
+    fcsintym.monitor()
+        
+    # Monitor various FCS status and state variables
+
+    # FCSSTATE: Possible values are: 
+    #
+    # 0 --> OK
+    # 1 --> idle
+    # 2 --> warning
+    # 3 --> lockout
+    # 4 --> emergency
+    
+    fcsstate = ktl.cache('deifcs', 'FCSSTATE')
+    fcsstate.monitor()
+
+    # FCSSTA: Possible values are:
+    #
+    # 0 --> Passive
+    # 1 --> Tracking
+    # 2 --> Warning
+    # 3 --> Seeking
+    # 4 --> Off_target
+    # 5 --> Lockout
+    # 6 --> Emergency
+    
+    fcssta = ktl.cache('deifcs', 'FCSSTA')
+    fcssta.monitor()
+
+    # FCSMODE: Possible values are:
+    #
+    # 0 --> Off
+    # 1 --> Monitor
+    # 2 --> Engineering
+    # 3 --> Track
+    # 4 --> Calibrate
+    
+    fcsmode = ktl.cache('deifcs', 'FCSMODE')
+    fcsmode.monitor()
+
+    # FCSTRACK: Possible values are:
+    #
+    # 0 --> on target
+    # 1 --> not correcting
+    # 2 --> seeking
+    # 3 --> off target
+    
+    fcstrack = ktl.cache('deifcs', 'FCSTRACK')
+    fcstrack.monitor()
+    
+    # FCSTASK: Possible values are:
+    #
+    # 0 --> Idle
+    # 1 --> Imaging
+    # 2 --> Processing
+    # 3 --> Correcting
+    
+    fcstask = ktl.cache('deifcs', 'FCSTASK')
+    fcstask.monitor()
+
+    # FCSSKIPS, FCSCCNOX/Y, FCSEXNOX/Y, FCSHBEAT
+    
+    fcsskips = ktl.cache('deifcs', 'FCSSKIPS')
+    fcsskips.monitor()
+    fcsccnox = ktl.cache('deifcs', 'FCSCCNOX')
+    fcsccnox.monitor()
+    fcsccnoy = ktl.cache('deifcs', 'FCSCCNOY')
+    fcsccnoy.monitor()
+    fcsexnox = ktl.cache('deifcs', 'FCSEXNOX')
+    fcsexnox.monitor()
+    fcsexnoy = ktl.cache('deifcs', 'FCSEXNOY')
+    fcsexnoy.monitor()
+    
+    fcshbeat = ktl.cache('deifcs', 'FCSHBEAT')
+    fcshbeat.monitor()
+    
+    # Monitor FCS detector configuration
+    
+    window = ktl.cache('deifcs', 'WINDOW')
+    window.monitor()
+    
+    binning = ktl.cache('deifcs', 'BINNING')
+    binning.monitor()
+    
+    autoshut = ktl.cache('deifcs', 'AUTOSHUT')
+    autoshut.monitor()
+    
+    # Monitor additional FCS keywords
+    
+    fcsfoto1 = ktl.cache('deifcs', 'FCSFOTO1')
+    fcsfoto1.monitor()    
+    fcsfoto2 = ktl.cache('deifcs', 'FCSFOTO2')
+    fcsfoto2.monitor()
+    
+    fcscusel = ktl.cache('deifcs', 'FCSCUSEL')
+    fcscusel.monitor()
+    
+    fcsboxx = ktl.cache('deifcs', 'FCSBOXX')
+    fcsboxx.monitor()
+    fcsboxy = ktl.cache('deifcs', 'FCSBOXY')
+    fcsboxy.monitor()
+    
+    # Monitor number of matching reference files
+
+    fcsnogra = ktl.cache('deifcs', 'FCSNOGRA')
+    fcsnogra.monitor()
+    fcsnosli = ktl.cache('deifcs', 'FCSNOSLI')
+    fcsnosli.monitor()
+    fcsnowav = ktl.cache('deifcs', 'FCSNOWAV')
+    fcsnowav.monitor()
+    fcsnofil = ktl.cache('deifcs', 'FCSNOFIL')
+    fcsnofil.monitor()
+    fcsnofoc = ktl.cache('deifcs', 'FCSNOFOC')
+    fcsnofoc.monitor()
 
 
-# Construct the FCS reference file name
+    #-----------------------------------#
+    # Initialize configuration keywords #
+    #-----------------------------------#
 
-refname = 'fcsref.' + gratenam + '.slider' + str(gratepos) + '.at.' +\
-          str(wavel) + '.' + dwfilnam + '.ref'
+    # Start with no errors
 
-# Rename the file name if already exists
+    fcserr.write(0)
 
-if os.path.isfile(refname):
-    suffix = str("%05d" % randint(00000,99999))
-    os.rename(refname, refname+'.'+suffix)
+    # Intialize FCS state keywords
 
-#--------------------------------------#
-# Write the FCS reference file in disk #
-#--------------------------------------#
+    fcsstate.write('OK', wait=True)
+    fcssta.write('Passive', wait=True)
+    fcsmode.write('Off', wait=True)
+    fcstrack.write('not correcting', wait=True)
+    fcstask.write('Idle', wait=True)
 
-try:
-    f = open(refname, 'w')
-except:
-    raise FcsWriteNotAllowed(refname, output_dir)
+    # Initialize focus tolerance keywords
 
-f.write(refname + '\n')
-f.write(gratenam + '\n')
-f.write(str(gratepos) + '\n')
-f.write(str(rotatval) + '\n')
-f.write(str(wavel) + '\n')
-f.write(str(output_dir) + '\n')
+    fcsfoto1.write(config['FCSFOTO1'])
+    fcsfoto2.write(config['FCSFOTO2'])
 
-f.close()
+    # Initialize CuAr selected lamp keyword
+    
+    fcscusel.write(config['FCSCUSEL'])
+    
+    # Initialize FCS box size keywords
 
-print ('')
-print ('#############################################')
-print ('')
-print ('fcsref successful. Contents of snapshot file:')
+    fcsboxx.write(config['FCSBOXX'])
+    fcsboxy.write(config['FCSBOXY'])
 
-f = open(refname, 'r')
-print (f.read())
-f.close()
+    # Initialize nuber of matching reference files
 
-print ('#############################################')
-print ('')
+    fcsnogra.write(0)
+    fcsnosli.write(0)
+    fcsnowav.write(0)
+    fcsnofil.write(0)
+    fcsnofoc.write(0)
+    
+    # Initialize detector configuration keywords
+
+    chip = config['WINDOW'].split(',')[0]
+    xstart = config['WINDOW'].split(',')[1]
+    ystart = config['WINDOW'].split(',')[2]
+    xlen = config['WINDOW'].split(',')[3]
+    ylen = config['WINDOW'].split(',')[4]
+    
+    xbinning = config['BINNING'].split(',')[0]
+    ybinning = config['BINNING'].split(',')[1]
+
+    window_str = '\n\tchip number ' + chip + '\n\txstart ' + xstart + \
+                 '\n\tystart ' + ystart + '\n\txlen ' + xlen + '\n\tylen ' + ylen
+    binning_str = '\n\tXbinning ' + xbinning + '\n\tYbinning ' + ybinning
+    
+    window.write(window_str)
+    binning.write(binning_str)
+    autoshut.write(config['AUTOSHUT'])
+    
+
+    #------------------------------#
+    # Initialize control veriables #
+    #------------------------------#
+
+    output_dir = '/s'+str(outdir)
+
+    # OVERRIDES output directory for testing purposes.
+
+    output_dir = '/home/calvarez/Work/scripts/deimos/test_data'
+
+    os.chdir(output_dir)
+
+    fcs_err = fcserr.read()
+    fcs_state = fcsstate.read()
+    fcs_sta = fcssta.read()
+    fcs_mode = fcsmode.read()
+    fcs_track = fcstrack.read()
+    fcs_task = fcstask.read()
+    fcs_heart_beat = 0
+
+    active_flamp = 'none'
+
+    fcs_ref_files_found = 0
+
+    fcs_gain = 0
+
+    ref_name = fcsreffi.read()
+    ref_image = fcsimgfi.read()
+    log_name = fcslogfi.read()
+
+    fcsslbad = 0
+    fcsetmis = 0
+    fcslamis = 0
+    fcsfomis = 0
+    fcstmlim = 0
+    fcsdxlim = 0
+    fcsdymin = 0
+
+    x_integ = 0
+    y_integ = 0
+
+    x_track_min =  999.999
+    x_track_max = -999.999
+    y_track_min =  999.999
+    y_track_max = -999.999
+    
+    x_slew_min =  999.999
+    x_slew_max = -999.999
+    y_slew_min =  999.999
+    y_slew_max = -999.999
+    
+
+    #------------------------------#
+    # Define dictionary containing #
+    # the control variables.       #
+    #------------------------------#
+
+    ctrl_var = { 'fcs_err':fcs_err, 'fcs_state':fcs_state, 'fcs_sta': fcs_sta, \
+                 'fcs_mode': fcs_mode, 'fcs_track': fcs_track, 'fcs_task': fcstask, \
+                 'fcs_heart_beat': fcs_heart_beat, 'active_flamp': active_flamp, \
+                 'fcs_ref_files_found': fcs_ref_files_found, 'fcs_gain': fcs_gain, \
+                 'ref_name': ref_name, 'ref_image': ref_image, 'log_name': log_name, \
+                 'output_dir': output_dir }
+
+    return ctrl_var
+
+
+def checkCommunications(ctrl_var):
+    
+    """
+    Check communications with keyword services
+    """
+
+    # Check communications with the deifcs service.
+    
+    fcstask = ktl.cache('deifcs', 'FCSTASK')
+    try:
+        fcstask.monitor()
+    except ktl.ktlError:
+        ctrl_var = fcs_exceptions.DeifcsCommunicationFailure('FCSTASK', ctrl_var)
+
+    # Check communications with the deiccd service.
+
+    ampmode = ktl.cache('deiccd', 'AMPMODE')
+    try:
+        ampmode.monitor()
+    except ktl.ktlError:
+        ctrl_var = fcs_exceptions.DeiccdCommunicationFailure('AMPMODE', ctrl_var)
+
+    # Check communications with the deimot service.
+    
+    gratenam = ktl.cache('deimot', 'GRATENAM')
+    try:
+        gratenam.monitor()
+    except ktl.ktlError:
+        ctrl_var = fcs_exceptions.DeimotCommunicationFailure('GRATENAM', ctrl_var)
+
+    # Check communications with the deirot service.
+
+    rotatval = ktl.cache('deirot', 'ROTATVAL')
+    try:
+        rotatval.monitor()
+    except ktl.ktlError:
+        ctrl_var = fcs_exceptions.DeirotCommunicationFailure('ROTATVAL', ctrl_var)
+
+    return ctrl_var
+
+
+def updateState(config, ctrl_var):
+    
+    """
+    Update the master STATUS of the FCS loop
+    """
+
+    fcscusel = ktl.cache('deifcs', 'FCSCUSEL')
+    fcserr = ktl.cache('deifcs', 'FCSERR')
+    fcstask = ktl.cache('deifcs', 'FCSTASK')
+    fcsstate = ktl.cache('deifcs', 'FCSSTATE')
+    fcssta = ktl.cache('deifcs', 'FCSSTA')
+    fcstrack = ktl.cache('deifcs', 'FCSTRACK')
+    fcsmode = ktl.cache('deifcs', 'FCSMODE')
+    fcshbeat = ktl.cache('deifcs', 'FCSHBEAT')
+
+    #---------------------------------------------#
+    # Compute master status. Logic is based on    #
+    # memo from Wirth and Faber, "Proposed design #
+    # for FCS GUI", January 2, 2003.              #
+    #---------------------------------------------#
+
+    # Color codes based on the FCSSTA keyword:
+    #
+    # 0 --> Passive    --> Gray
+    # 1 --> Tracking   --> Green
+    # 2 --> Warning    --> Yellow
+    # 3 --> Seeking    --> Yellow
+    # 4 --> Off_target --> Red
+    # 5 --> Lockout    --> Red
+    # 6 --> Emergency  --> Red
+
+    if ( fcsstate.read() == 'emergency' ):
+        ctrl_var['fcs_status'] = 'Emergency'
+    elif ( fcsstate.read() == 'lockout' ):
+        ctrl_var['fcs_status'] = 'Lockout'
+    elif ( fcstrack.read() == 'off target' ):
+        ctrl_var['fcs_status'] = 'Off_target'
+    elif ( fcsstate.read() == 'OK' ) and ( fcstrack.read() == 'seeking' ):
+        ctrl_var['fcs_status'] = 'Seeking'
+    elif ( fcsstate.read() == 'warning' ):
+        ctrl_var['fcs_status'] = 'Warning'
+    elif ( fcsstate.read() == 'OK' ) and ( fcstrack.read() == 'on target' ):
+        ctrl_var['fcs_status'] = 'Tracking'
+    elif ( fcsmode.read() == 'Off' ) or ( fcsmode.read() == 'Monitor' ) or \
+         ( fcsstate.read() == 'idle' ) or ( fcstrack.read() == 'not correcting' ):
+        ctrl_var['fcs_status'] = 'Passive'
+    else:
+        ctrl_var['fcs_status'] = 'Emergency'
+
+
+    # Send notification of any changes in FCS TASK
+        
+    if fcstask.read() != ctrl_var['fcs_task']:
+        msg = 'fcstask changed from ' + fcstask.read() + ' to ' + \
+              ctr_lvar['fcs_task'] + ' at ' + str(dt.datetime.now())
+        fcs_auxiliary.logMessage(msg)
+        fcstask.write(ctrl_var['fcs_task'], wait=True)
+
+    # Send notification of any changes in FCS STATE
+        
+    if fcsstate.read() != ctrl_var['fcs_state']:
+        msg = 'fcsstate changed from ' + fcsstate.read() + ' to ' + \
+              ctr_lvar['fcs_state'] + ' at ' + str(dt.datetime.now())
+        fcs_auxiliary.logMessage(msg)
+        fcsstate.write(ctrl_var['fcs_state'], wait=True)
+
+    # Send notification of any changes in FCS TRACK
+        
+    if fcstrack.read() != ctrl_var['fcs_track']:
+        msg = 'fcstrack changed from ' + fcstrack.read() + ' to ' + \
+              ctr_lvar['fcs_track'] + ' at ' + str(dt.datetime.now())
+        fcs_auxiliary.logMessage(msg)
+        fcstrack.write(ctrl_var['fcs_track'], wait=True)
+
+    # Send notification of any changes in FCS master STATUS
+        
+    if fcssta.read() != ctrl_var['fcs_status']:
+        msg = 'fcssta changed from ' + fcssta.read() + ' to ' + \
+            ctr_lvar['fcs_status'] + ' at ' + str(dt.datetime.now())
+        fcs_auxiliary.logMessage(msg)
+        fcssta.write(ctrl_var['fcs_status'], wait=True)
+
+    # Update the name of the active FCS lamp
+
+     if ( ctrl_var['active_flamp'] == 'Cu1' ) or ( ctrl_var['active_flamp'] != 'Cu2' ) and ( fcscusel.read() != ctrl_var['active_flamp'] ):
+        ctrl_var['active_flamp'] = fcscusel.read()
+        fcs_exceptions.SwitchToAnotherFcsLamp(fcscusel.read())
+
+    # Clear any previous error state
+
+    if ( fcserr.read() < 0 ) and ( fcserr.read() != ctrl_var['fcs_err'] ):
+        ctrl_var['fcs_err'] = 0
+        fcserr.write(ctrl_var['fcs_err'], wait=True)
+
+    # FCS state control variable at the start of the current 
+    # loop iteration is OK.
+
+    ctrl_var['fcs_state'] = 'OK', wait=True)
+
+    # Update FCS heartbeat keyword.
+
+    ctrl_var['fcs_heart_beat'] = ctrl_var['fcs_heart_beat'] + 1
+    ctrl_var['fcs_heart_beat'] = ctrl_var['fcs_heart_beat'] % 10000
+    fcshbeat.write(ctrl_var['fcs_heart_beat'], wait=True)
+
+    return ctrl_var
+
+
+def checkSanity(config, ctrl_var):
+    
+    """
+    Check that DEIMOS has the minimum optical configuration required for 
+    the FCS to function correctly.
+    """
+
+    gratenam = ktl.cache('deimot', 'GRATENAM')
+    gratepos = ktl.cache('deimot', 'GRATEPOS')
+    grtltwav = ktl.cache('deimot', 'G'+str(gratepos)+'TLTWAV')
+    grtltnom = ktl.cache('deimot', 'G'+str(gratepos)+'TLTNOM')
+
+    dwfilnam = ktl.cache('deimot', 'DWFILNAM')
+
+    outdir = ktl.cache('deifcs', 'OUTDIR')
+
+    try:
+        gratenam.monitor()
+        gratepos.monitor()
+        grtltwav.monitor()
+        grtltnom.monitor()
+        dwfilnam.monitor()
+    except ktl.ktlError:
+        ctrl_var = fcs_exceptions.DeimotKeywordAccessFailure(ctrl_var)
+        
+    if ( gratenam == 'Unknown' ) or ( gratepos == -999 ):
+        ctrl_var = fcs_exceptions.NoSliderClampedDown(ctrl_var)
+
+    if ( gratepos not in config['VALID_GRATING_POSITIONS'] ):
+        ctrl_var = fcs_exceptions.NoSliderClampedDown(ctrl_var)
+
+    if ( dwfilnam == 'Unknown' ):
+        ctrl_var = fcs_exceptions.FilterChangeInProgress(ctrl_var)
+
+    try:
+        outdir.monitor()
+    except ktl.ktlError:
+        ctrl_var = fcs_exceptions.FcsOutdirNotAccessibleFromDeifcs(ctrl_var)
+
+    return ctrl_var
+
+
+def searchFcsRefImage(config, ctrl_var):
+
+    """
+    Search for an FCS reference file corresponding to
+    the current optical cofiguration. Files can be
+    located in either the current directory or in
+    the FCS reference frames archive.
+    """
+    
+    #------------------------------------#
+    # List possible reference file names #
+    #------------------------------------#
+
+    # Determine the current optical configuration
+
+    gratenam = ktl.cache('deimot', 'GRATENAM')
+    gratepos = ktl.cache('deimot', 'GRATEPOS')
+
+    gratenam.monitor()
+    gratepos.monitor()
+
+    if ( gratepos == 2 ) or ( gratepos == 0 ):
+        tiltwav = 0.0
+    else:
+        grtltwav = ktl.cache('deimot', 'G'+str(gratepos)+'TLTWAV')
+        grtltwav.monitor()
+        tiltwav = grtltwav
+
+    # Round the wavelength to the number of significant
+    # digits defined in the configuration file
+    
+    wavel = np.around(float(tiltwav), \
+                      decimals=int(config['CENTRAL_WAVELENGTH_ACCURACY']))
+
+    dwfilnam = ktl.cache('deimot', 'DWFILNAM')
+    dwfilnam.monitor()
+
+    outdir = ktl.cache('deifcs', 'OUTDIR')
+    outdir.monitor()
+    
+    ctrl_var['output_dir'] = '/s'+str(outdir)
+
+    ### OVERRIDES output directory for testing purposes. ###
+
+    ctrl_var['output_dir'] = '/home/calvarez/Work/scripts/deimos/test_data'
+    os.chdir(output_dir)
+
+    approot = '.' + gratenam.read() + '.slider' + gratepos.read() + '.at.' + str(wavel)
+    refroot = 'fcsref' + approot + '.' + dwfilnam.read()
+    ctrl_var['ref_file'] = refroot + '.ref'
+
+    fcsref_filename_for_current_config = output_dir + '/' + ref_file
+
+    fcsreffi = ktl.cache('deifcs', 'FCSREFFI')
+    fcsreffi.monitor()
+    fcsimgfi = ktl.cache('deifcs', 'FCSIMGFI')
+    fcsimgfi.monitor()
+    fcslogfi = ktl.cache('deifcs', 'FCSLOGFI')
+    fcslogfi.monitor()
+
+    fcsnogra = ktl.cache('deifcs', 'FCSNOGRA')
+    fcsnogra.monitor()
+    fcsnosli = ktl.cache('deifcs', 'FCSNOSLI')
+    fcsnosli.monitor()
+    fcsnowav = ktl.cache('deifcs', 'FCSNOWAV')
+    fcsnowav.monitor()
+    fcsnofil = ktl.cache('deifcs', 'FCSNOFIL')
+    fcsnofil.monitor()
+    fcsnofoc = ktl.cache('deifcs', 'FCSNOFOC')
+    fcsnofoc.monitor()
+
+    #-------------------------------------------------#
+    # Check if the reference file name stored in the  #
+    # keyword FCSREFFI is on either the local FCS     #
+    # directory, or on the FCSREF_ARCHIVE directory.  #
+    #-------------------------------------------------#
+
+    if fcsreffi != fcsref_filename_for_current_config:
+
+        #-------------------------------------------------------------#
+        # If FCSREFFI does not match the current configuration, then  #
+        # this is because the optical configuration has changed since #
+        # the last time the keyword FCSREFFI was written.             #
+        #-------------------------------------------------------------#
+
+        fcs_ref_files_found = 0
+
+        message = 'Configuration has just changed.'
+        fcs_auxiliary.logMessage(message)
+
+        if Path(fcsref_filename_for_current_config).is_file():
+
+            #----------------------------------------------------#
+            # Check if there is a file in the current FCS outdir # 
+            # that matches the FCS reference file name for the   #
+            # current optical configuration.                     #
+            #----------------------------------------------------#
+
+            ctrl_var['ref_name'] = fcsref_filename_for_current_config
+            message = 'Reference file for this configuration is %s.' % refname
+            fcs_auxiliary.logMessage(message)
+            ctrl_var['log_name'] = fcsref_filename_for_current_config[:-4] + '.log'
+
+            fcsnogra.write(1)
+            fcsnosli.write(1)
+            fcsnowav.write(1)
+            fcsnofil.write(1)
+
+            fcs_ref_files_found = 1 
+
+        else:
+
+            #-------------------------------------------#
+            # Look for the reference file in the on the #
+            # FCS reference file archive.               #
+            #-------------------------------------------#
+
+            this_year = int(dt.datetime.now().year)
+            year_list = this_year - range(config['YEARS_BACK'])
+        
+            all_archived_ref_dates = os.listdir(config['FCSREF_ARCHIVE'])
+
+            selected_archived_ref_dates_full_path = []
+
+            for year in year_list:
+
+                for date_dir in all_old_dates:
+
+                    dir_matches_year = re.match(str(year), datedir)
+
+                    if dir_matches_year != None:
+
+                        selected_archived_ref_dates_full_path.append(config['FCSREF_ARCHIVE'] + datedir)
+
+            matched_archived_ref_dirs = []
+            matched_archived_ref_files = []
+
+            for date_dir_full_path in selected_archived_ref_dates_full_path:
+
+                file_matches_current_config_ref_file = re.match(date_dir_full_path, ref_file)
+
+                if file_matches_current_config_ref_file != None:
+
+                    matched_archived_ref_dirs.append(date_dir_full_path)
+                    matched_archived_ref_files.append(date_dir_full_path + '/' + ref_file)
+               
+            number_of_matched_ref_files = len(matched_archived_ref_files)
+     
+            fcsnogra.write(number_of_matched_ref_files)
+            fcsnosli.write(number_of_matched_ref_files)
+            fcsnowav.write(number_of_matched_ref_files)
+            fcsnofil.write(number_of_matched_ref_files)
+
+            fcs_ref_files_found = number_of_matched_ref_files
+
+            #------------------------------------------#
+            # Update the refname, refimage and logname #
+            # variables depending on how many matching #
+            # files have been found.                   #
+            #------------------------------------------#
+                
+            if number_of_matched_ref_files > 0:
+                
+                # Select the first matching file on the list
+                # and create the corresponding log file
+                                
+                ctrl_var['ref_name'] = matched_archived_ref_files[0]
+                message = 'Matched reference file for this configuration is %s.' % refname
+                fcs_auxiliary.logMessage(message)
+                ctrl_var['log_name'] = fcsref_filename_for_current_config[:-4] + '.log'
+                
+            else:
+
+                # There is NOT a file that matches the 
+                # FCS reference name for the current 
+                # configuration.
+
+                ctrl_var['ref_name'] = ''
+                ctrl_var['log_name'] = ''
+
+                raise fcs_exceptions.FcsrefAccessFailure(fcsref_filename_for_current_config)                    
+
+        #-----------------------------------------------#
+        # Create a log file if a matching FCS reference #
+        # file exists the log file does not exist yet.  #
+        #-----------------------------------------------#
+
+        if fcs_ref_files_found > 0:
+
+            if not Path(logname).is_file():
+            
+                try:
+                    Path(logname).touch()
+                    message = 'Log file %s successdully created.' % logname
+                    fcs_auxiliary.logMessage(message)
+                except:
+                    raise fcs_exceptions.FcsLogFileWriteNotAllowed(logname)
+        
+        fcsreffi.write(ctrl_var['ref_file'])
+        fcslogfi.write(ctrl_var['logname'])
+
+
+        #----------------------------------------------#
+        # If an FCS reference file was found for the   #
+        # current optical configuration, then read it. #
+        #----------------------------------------------#
+
+        if fcs_ref_files_found > 0:
+
+            f = open(fcsref_filename_for_current_config, 'r')
+            all_lines = f.readlines()
+            f.close()
+            
+            if len(all_lines) != 12:
+                raise fcs_exceptions.IncompleteFcsReferenceFile(fcsref_filename_for_current_config)
+
+            ref_outdir = all_lines[9].strip()
+            ref_outfile = all_lines[10].strip()
+            ref_frameno = all_lines[11].strip()
+
+            msg = 'Reference image file outdir is %s' % ref_outdir
+            fcs_auxiliary.logMessage(msg)
+            msg = 'Reference image file outfile is %s' % ref_outfile
+            fcs_auxiliary.logMessage(msg)
+            msg = 'Reference image file frameno is %s' % ref_frameno
+            fcs_auxiliary.logMessage(msg)
+
+            ref_file_name = ref_outdir + 
+
+
+    else:
+
+        #------------------------------------------------#
+        # The keyword FCSREFFI matches the FCS reference #
+        # file name corresponding to the current optical #
+        # configuration.                                 #
+        #------------------------------------------------#
+
+        ctrl_var['ref_name'] = fcsreffi.read()
+        ctrl_var['ref_image'] = fcsimgfi.read()
+        ctrl_var['log_name'] = fcslogfi.read()
+        ctrl_var['fcs_gain'] = fcs_gain
+
+    return ctrl_var
+
+
+def takeFcsImage(config, ctrl_var):
+
+    """
+    - Check FCS and science CCDs exposure status
+    - Take a new FCS image, if possible    
+    """
+
+    return fcsimage, ctrl_var
+
+
+def calculateXcorr(config, ctrl_var, fcsimage, refimage):
+
+    """
+    - Perform x-corr between current and reference FCS images
+    - Transform x-corr results into corrections
+    """
+
+    return results, ctrl_var
+
+    
+def moveStages(config, ctrl_var, results):
+
+    """
+    - Read corrections from calculateXcorr
+    - Move stages if needed
+    - Update the FCS status keywords
+    """
+
+    return ctrl_var
+
+##################
+##################
+## Main program ##
+##################
+##################
+
+if __name__ == '__main__':
+    
+    fcs_config = fcs_auxiliary.parseConfigFile()
+    control_var = intializeControlLoop(fcs_config)
+ 
+    while True:
+
+        try:
+            main(fcs_config, control_var)
+
+        except fcs_exceptions.FcsError as exception:
+            fcs_auxiliary.logErrorMessage(exception.error_code, exception.error_message)
+                    
 
 sys.exit(0)
 

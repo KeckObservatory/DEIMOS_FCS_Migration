@@ -1,0 +1,130 @@
+#! /kroot/rel/default/bin/kpython3
+
+"""
+Name: 
+        ds9
+
+Purpose:
+        Define class ds9 to contain wrappers to XPA
+        access points.
+
+Syntax:
+	ds9(ds9-name)
+
+Parameters:
+	ds9-name: the name of the ds9 display to connect to 
+		[default="deimos_ccd_autodisplay"]
+
+Logging:
+
+
+Modification history:
+
+       2018-Jun-28      CAAI     Original version based on the ds9.py
+                                 for MOSFIRE by MK
+
+"""
+
+#-----------------------#
+# Import Python modules #
+#-----------------------#
+
+import numpy as np
+import os, sys
+import shlex
+import subprocess as sp
+import time as tm
+import logging as lg
+import ktl
+
+#--------------------#
+# Cache KTL keywords #
+#--------------------#
+
+outdir = ktl.cache('deiccd', 'OUTDIR')
+
+#---------------#
+# Define clases #
+#---------------#
+
+class ds9:
+
+   """
+   The ds9 class provides wrappers around the unix commands xpaget
+   and xpaset. The class is smart enough to automatically detect a
+   running ds9 and attach automatically displayed images to it
+   """
+
+   def __init__(self, title):
+      """
+      ds9 construction init checks to see if a ds9 called title
+      is currently running. If not, a new ds9 instance is created 
+      with that title
+      """
+
+      self.title = title
+      
+      cmd = shlex.split('xpaget %s' % self.title)
+      
+      devnull = open( '/dev/null', 'w')
+      retcode = sp.Popen(cmd, stdout=devnull, stderr=devnull).returncode
+
+      if retcode == 1:
+
+         sp.Popen(['ds9', '-title', self.title , '-preserve', 'pan', 'yes', \
+                   '-cd', '/s/'+outdir.read()], stdout=sp.PIPE)
+         
+#         tm.sleep(1)
+                        
+
+   def xpaget(self, cmd):
+      """
+      xpaget is a convenience function around unix xpaget
+      """
+
+      cmd = shlex.split("xpaget %s %s" % (self.title, cmd))
+      retcode = subprocess.call(cmd)
+
+
+   def xpapipe(self, cmd, pipein):
+      """
+      xpapipe is a convenience wrapper around echo pipein | xpaset ...
+      """
+
+      cmd = shlex.split('xpaset %s %s' % (self.title, cmd))
+      p = sp.run(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+   def xpaset(self, cmd):
+      """
+      xpaset is a convenience function around unix xpaset
+      """
+
+      xpacmd = "xpaset -p %s %s" % (self.title, cmd)
+      lg.debug(xpacmd)
+      print(xpacmd)
+
+      cmd = shlex.split(xpacmd)
+      print(cmd)
+
+      retcode = sp.run(cmd).returncode
+      lg.debug("retcode = %s" % retcode) 
+      print(retcode)
+
+   def frameno(self, frame):
+      """
+      frameno sets the ds9 frame number to [frame]
+      """
+
+      print(frame)
+      self.xpaset("frame %i" %frame)
+      
+
+   def open(self, fname, frame):
+      """
+      open a fits file [fname] into frame [frame]
+      """
+      
+      self.frameno(frame)
+      self.xpaset("file %s" % fname)
+

@@ -187,7 +187,7 @@ else if ( $gratepos == 3 ) then
       modify -s deimot g3tltoff=0
       if( $status ) then
         set local_status = $status
-        echo "error $local_status recentering slider 3 tilt offset
+        echo "error $local_status recentering slider 3 tilt offset"
         set message = \
     "fcszero command got error $local_status when zeroing slider 3 tilt offset"
         set fcserr  = -211
@@ -242,7 +242,7 @@ else if ( $gratepos == 4 ) then
       modify -s deimot g4tltoff=0
       if( $status ) then
         set local_status = $status
-        echo "error recentering slider 4 tilt offset
+        echo "error recentering slider 4 tilt offset"
         set message = \
      "fcszero command got error $local_status when zeroing slider 4 tilt offset"
         set fcserr  = -213

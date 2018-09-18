@@ -1,0 +1,147 @@
+#! /kroot/rel/default/bin/kpython3
+
+"""
+Name: 
+        ds9_ccd
+
+Purpose:
+        Define class ds9 to contain wrappers to XPA
+        access points.
+
+Syntax:
+	ds9_ccd [ds9_name]
+
+Parameters:
+	ds9_name: the name of the ds9 display to connect to 
+		  [default="deimos_fcs_autodisplay"]
+
+Restrictions:
+        Need to have the correct ~/.ds9_ccd.prf
+
+
+Modification history:
+
+       2018-Jun-28      CAAI     Original version based on the ds9.py
+                                 for MOSFIRE by MK.
+
+"""
+
+#-----------------------#
+# Import Python modules #
+#-----------------------#
+
+import os, sys
+import shlex
+import subprocess as sp
+import time as tm
+import logging as lg
+import ktl
+
+#------------------#
+# Define constants #
+#------------------#
+
+GEOMETRY = '1075x700'
+PRESERVE_PAN = 'yes'
+SLEEP_TIME = 3
+
+#--------------------#
+# Cache KTL keywords #
+#--------------------#
+
+outdir = ktl.cache('deiccd', 'OUTDIR')
+
+#---------------#
+# Define clases #
+#---------------#
+
+class ds9:
+
+   """
+   The ds9 class provides wrappers around the unix commands xpaget
+   and xpaset. The class is smart enough to automatically detect a
+   running ds9 and attach automatically displayed images to it
+   """
+
+   def __init__(self, title):
+      """
+      ds9 construction init checks to see if a ds9 called title
+      is currently running. If not, a new ds9 instance is created 
+      with that title
+      """
+
+      self.title = title
+      
+      cmd = shlex.split('xpaget %s' % self.title)
+      
+      devnull = open( '/dev/null', 'w')
+      retcode = sp.run(cmd, stdout=devnull, stderr=devnull).returncode
+
+      if retcode == 1:
+
+         sp.Popen(['ds9_ccd', '-title', self.title , '-geometry', GEOMETRY, \
+                   '-cd', '/s/'+outdir.read()])
+         tm.sleep(SLEEP_TIME)
+
+      else:
+
+         p1 = sp.run(['ps', '-fu', os.environ['USER']], stdout=sp.PIPE)
+         p2 = sp.run(['grep', 'ds9_ccd'], input=p1.stdout, stdout=sp.PIPE)
+         p3 = sp.run(['grep', self.title], input=p2.stdout, stdout=sp.PIPE)
+         print('')
+         print('ERROR: An instance of ds9_ccd with title ' + self.title + 'already exists.')
+         print('Please, kill the following process before running ccd_monitor_and_display:')
+         print('')
+         print(p3.stdout.decode('utf-8').strip())
+         print('')
+         sys.exit(1)
+
+   def xpaget(self, cmd):
+      """
+      Convenience function around unix xpaget
+      """
+
+      cmd = shlex.split("xpaget %s %s" % (self.title, cmd))
+      xpaget_sp_out = sp.run(cmd, stdout=sp.PIPE).stdout.decode('utf-8').strip()
+   
+      return xpaget_sp_out
+
+
+   def xpaset(self, cmd):
+      """
+      Convenience function around unix xpaset
+      """
+
+      xpacmd = "xpaset -p %s %s" % (self.title, cmd)
+      lg.debug(xpacmd)
+
+      cmd = shlex.split(xpacmd)
+      retcode = sp.run(cmd).returncode
+
+      lg.debug("retcode = %s" % retcode) 
+
+
+   def frameno(self, frame):
+      """
+      Set the ds9 frame number to [frame]
+      """
+
+      self.xpaset("frame %i" %frame)
+      
+
+   def open(self, fname, frame):
+      """
+      Open a FITS file [fname] into frame [frame]
+      """
+      
+      self.frameno(frame)
+      self.xpaset("file %s" % fname)
+
+
+   def openMosaic(self, fname, frame):
+      """
+      Open a FITS mosaic file [fname] into frame [frame]
+      """
+      
+      self.frameno(frame)
+      self.xpaset("mosaicimage %s" % fname)

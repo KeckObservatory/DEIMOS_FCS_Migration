@@ -1,0 +1,56 @@
+#!/bin/csh -f
+#+
+# MOSFIRE library of scripts
+#
+# NAME
+#     start_autodisplay - wrapper script to start autodisplay 
+#
+# SYNOPSIS
+#	start_autodisplay [ -i | -g  [display]]
+#
+# DESCRIPTION
+#       Launch a autodisplay software on the current display
+#
+# ARGUMENTS
+#
+# OPTIONS
+#
+# EXAMPLES
+#
+# ENVIRONMENT VARIABLES
+#
+# FILES
+#
+# SERVERS & KEYWORDS
+#
+# SCRIPTS CALLED
+#     mosfire start autodisplay
+#     ds9 -title Autodisplay
+#
+#
+# EXIT STATUS
+#     0 - normal exit, no error
+#
+# SEE ALSO
+#
+# Modification History:
+#       2012-apr-01     MK  Original version
+#       2012 oct 29     MK  Added pan preservation options
+#                           Have the script always star it instead
+#                           of the python code which is less flexible.
+#------------------------------------------------------------------------------
+
+set python_pid = `get_mosfire_pid mosfireMonitorAndDisplay`
+
+
+
+if ($python_pid > 0) then
+   echo "Autodisplay heartbeat already running: Only starting ds9."
+   set outdir = `outdir`
+   ds9 -title Autodisplay -preserve pan yes -cd $outdir &   
+else
+
+  mosfire start autodisplay
+
+endif
+

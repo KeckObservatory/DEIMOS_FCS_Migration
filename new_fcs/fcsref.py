@@ -79,180 +79,381 @@ fcsref
 
 Modification history:
 
-2017-Aug-03     CA     Original version based on the cshell script
-                       fcsref by R. Kibrick (2002)
+2017-Aug-03     CAAI     Original version based on the cshell script
+                         fcsref by R. Kibrick (2002)
+2018-May-17     CAAI     Re-write the function parseConfigFile() as
+                         in fcstrack.py
 
 """
 
-#-----------------------#
-# Import Python modules #
-#-----------------------#
+###########################
+###########################
+## Import Python modules ##
+###########################
+###########################
 
 import sys, os
 import ktl
 from random import randint
 import numpy as np
-from fcs_exceptions import *
+import fcs_exceptions
+import fcs_auxiliary
 
-#------------------#
-# Define constants #
-#------------------#
 
-FCS_CONFIG_FILE = 'fcsconfig.dat'
+#######################
+#######################
+## Main control loop ##
+#######################
+#######################
 
-#------------------#
-# Define functions #
-#------------------#
+def main(config):
 
-def parseConfigFile():
+    #----------------------------------#
+    # Connect to keyword services,     #
+    # monitor keywords and check that  #
+    # the current configuration is     #
+    # adequate to take a reference     #
+    # frame.                           #
+    #----------------------------------#
 
-    """
-    Read configuration file, parse content
-    and create a dictionary with the file content.
-    """
+    #--------------------#
+    # Check grating name #
+    #--------------------#
 
-    f = open(FCS_CONFIG_FILE, 'r')
-    data = f.readlines()
-    f.close()
-    
-    param_set = {}
-    
-    for line in data:
+    gratenam = ktl.cache('deimot', 'GRATENAM')
+    try:
+        gratenam.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeimotCommunicationFailure('GRATENAM')
+
+    if ( gratenam not in config['VALID_GRATING_NAMES'] ):
+        raise fcs_exception.AbortOnInvalidGratingName(gratenam)
+
+    #-----------------------#
+    # Check slider position #
+    #-----------------------#
+
+    gratepos = ktl.cache('deimot','GRATEPOS')
+    try:
+        gratepos.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeimotCommunicationFailure('GRATEPOS')
+
+    if ( gratepos not in config['VALID_GRATING_POSITIONS'] ):
+        raise fcs_exception.AbortOnInvalidSliderPosition(gratepos)
+
+    #----------------------------------#
+    # Check grating central wavelength #
+    #----------------------------------#
+
+    if ( gratepos == 2 ) :
+        tiltwav = 0.0
+    elif ( gratepos == 3 ) or ( gratepos == 4 ) :
+        grtltwav = ktl.cache('deimot', 'G'+str(gratepos)+'TLTWAV')
+        try:
+            grtltwav.monitor()
+        except ktl.ktlError:
+            raise fcs_exceptions.AbortOnDeimotCommunicationFailure('G'+str(gratepos)+'TLTWAV')
+        tiltwav = grtltwav
+    else:
+        raise.fcs_exceptions.AbortOnGratingNotClampedForFcsRef()
+
+    #---------------------------------------------------#
+    # Round the wavelength to the number of significant #
+    # digits defined in the configuration file          #
+    #---------------------------------------------------#
+
+    wavel = np.around(float(tiltwav), \
+                      decimals=int(config['CENTRAL_WAVELENGTH_ACCURACY']))
+
+    #---------------------#
+    # Check rotator value #
+    #---------------------#
+
+    rotatval = ktl.cache('deirot', 'ROTATVAL')
+    try:
+        rotatval.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeirotCommunicationFailure('ROTATVAL')
+
+    #-----------------------------------------------------#
+    # Check that rotator is approximately centered on the #
+    # flexure curve for each slider                       #
+    #-----------------------------------------------------#
+
+    if gratepos == 2:
+        check_rotator_pa(gratepos, float(config['SLIDER2_FLEXURE_CENTER']), float(config['SLIDER2_FLEXURE_CENTER_DELTA']), pa)
+
+    elif gratepos == 3:
+        check_rotator_pa(gratepos, float(config['SLIDER3_FLEXURE_CENTER']), float(config['SLIDER3_FLEXURE_CENTER_DELTA']), pa)
+
+    elif gratepos == 4:
+        check_rotator_pa(gratepos, float(config['SLIDER4_FLEXURE_CENTER']), float(config['SLIDER4_FLEXURE_CENTER_DELTA']), pa)
+
+    else:
+        raise fcs_auxiliary.AbortOnNoSliderClampedDown()
+
+    #---------------------------#
+    # Check grating tilt offset #
+    #---------------------------#
+
+    if ( gratepos == 2 ) :
+        tiltwav = 0.0
+
+    if ( gratepos == 3 ) or ( gratepos == 4 ):
+        grtltoff = ktl.cache('deimot', 'G'+str(gratepos)+'TLTOFF')
+        try:
+            grtltoff.monitor()
+        except ktl.ktlError:
+            raise fcs_exceptions.AbortOnDeimotCommunicationFailure('G'+str(gratepos)+'TLTOFF')
         
-        if ( len(line.strip()) != 0 ):
+        if grtltoff == 0:
+            raise fcs_exceptions.AbortOnGratingTiltOffsetNotCenteredForFcsRef(gratepos)
 
-            if ( line.strip()[0] != '#' ):
+        tiltwav = grtltwav
 
-                key = line.strip().split('=')[0].strip()
-                value = line.strip().split('=')[1].strip()
+    #-------------------#
+    # Check filter name #
+    #-------------------#
 
-                param_set[key] = value
+    dwfilnam = ktl.cache('deimot', 'DWFILNAM')
+    try:
+        dwfilnam.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeimotCommunicationFailure('DWFILNAM')
 
-    return param_set
+    #--------------------------------#
+    # Check the tent mirror position #
+    #--------------------------------#
 
-#--------------#
-# Main program #
-#--------------#
+    tmirrval = ktl.cache('deimot', 'TMIRRVAL')
+    try:
+        tmirrval.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeimotCommunicationFailure('TMIRRVAL')
 
-#--------------------------------------------#
-# Load configuration from fcsconfig.dat file #
-#--------------------------------------------#
+    TENT_MIRROR_CENTER_LLIM = config['TENT_MIRROR_CENTER'] - config['TENT_MIRROR_CENTER_DELTA']
+    TENT_MIRROR_CENTER_ULIM = config['TENT_MIRROR_CENTER'] + config['TENT_MIRROR_CENTER_DELTA']
 
-config = parseConfigFile()
+    if ( tmirrval < TENT_MIRROR_CENTER_LLIM ) or ( tmirrval > TENT_MIRROR_CENTER_ULIM ):
+        raise fcs_exceptions.AbortOnTentMirrorNotCenteredForFcsRef(tmirrval)
 
-print (config)
+    #-------------------------------------#
+    # Check the dewar X translation stage #
+    #-------------------------------------#
 
-# Parse the list of valid grating positions
+    dwxl8raw = ktl.cache('deimot', 'DWXL8RAW')
+    try:
+        dwxl8raw.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeimotCommunicationFailure('DWXL8RAW')
 
-VALID_GRATING_POS = config['VALID_GRATING_POSITIONS'].split(',')
+    DEWAR_TRANSLATION_STAGE_CENTER_LLIM = config['DEWAR_TRANSLATION_STAGE_CENTER'] - config['DEWAR_TRANSLATION_STAGE_CENTER_DELTA']
+    DEWAR_TRANSLATION_STAGE_CENTER_ULIM = config['DEWAR_TRANSLATION_STAGE_CENTER'] + config['DEWAR_TRANSLATION_STAGE_CENTER_DELTA']
 
-# Parse the list of valid grating names
+    if ( dwxl8raw < DEWAR_TRANSLATION_STAGE_CENTER_LLIM ) or ( dwxl8raw > DEWAR_TRANSLATION_STAGE_CENTER_ULIM ):
+        raise fcs_exceptions.AbortOnDewarXTranslationNotCenteredForFcsRef(dwxl8raw)
 
-VALID_GRATING_NAM = config['VALID_GRATING_NAMES'].split(',')
+    #---------------------------------#
+    # Check the DEIMOS internal focus #
+    #---------------------------------#
 
-#----------------------------------#
-# Connect to keyword services,     #
-# monitor keywords and check that  #
-# the current configuration is     #
-# adequate to take a reference     #
-# frame.                           #
-#----------------------------------#
+    dwfocraw = ktl.cache('deimot', 'DWFOCRAW')
+    try:
+        dwfocraw.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeimotCommunicationFailure('DWFOCRAW')
 
-deimot = ktl.cache('deimot')
-deirot = ktl.cache('deirot')
-deifcs = ktl.cache('deifcs')
+    #----------------------------#
+    # Check the FCS lamps status #
+    #----------------------------#
 
-# Monitor grating name
+    flamps = ktl.cache('deifcs', 'FLAMPS')
+    try:
+        flamps.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeifcsCommunicationFailure('FLAMPS')
 
-gratenam = deimot['GRATENAM']
-gratenam.monitor()
-if ( gratenam not in VALID_GRATING_NAM ):
-    raise InvalidGratingName(gratenam)
+    if ( flamps == 'Off' ):
+        raise fcs_exceptions.AbortOnFcsLampsOffForFcsRef(flamps)
 
-# Monitor slider position
+    #--------------------------------#
+    # Check the FCS integration time #
+    #--------------------------------#
 
-gratepos = deimot['GRATEPOS']
-gratepos.monitor()
-if ( gratepos not in VALID_GRATING_POS ):
-    raise InvalidSliderPosition(gratepos)
+    ttime = ktl.cache('deifcs', 'TTIME')
+    try:
+        ttime.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeifcsCommunicationFailure('TTIME')
 
-# Monitor grating central wavelength
+    if ( ttime < config['FCS_MIN_EXPTIME'] ):
+        raise fcs_exceptions.AbortOnFcsExptimeTooShortFcsRef(ttime)
+    elif ( ttime > config['FCS_MAX_EXPTIME'] ):
+        raise fcs_exceptions.AbortOnFcsExptimeTooShortFcsRef(ttime)
 
-if ( gratepos == 2 ):
-    tltwav = 0.0
-else:
-    grtltwav = deimot['G'+str(gratepos)+'TLTWAV']
-    grtltwav.monitor()
-    tltwav = grtltwav
+    #------------------------------------#
+    # Check the FCS output filename root #
+    #------------------------------------#
 
-# Round the wavelength to the number of significant
-# digits defined in the configuration file
+    outfile = ktl.cache('deifcs', 'OUTFILE')
+    try:
+        outfile.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeifcsCommunicationFailure('OUTFILE')
 
-wavel = np.around(float(tltwav), \
-                  decimals=int(config['CENTRAL_WAVELENGTH_ACCURACY']))
+    #----------------------------#
+    # Check the FCS frame number #
+    #----------------------------#
 
-print(wavel)
+    frameno = ktl.cache('deifcs', 'FRAMENO')
+    try:
+        frameno.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeifcsCommunicationFailure('FRAMENO')
 
-# Monitor filer name
+    #--------------------------------#
+    # Check the FCS output directory #
+    #--------------------------------#
 
-dwfilnam = deimot['DWFILNAM']
-dwfilnam.monitor()
+    outdir = ktl.cache('deifcs', 'OUTDIR')
+    try:
+        outdir.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeifcsCommunicationFailure('OUTDIR')
 
-# Monitor rotator value
+    output_dir = '/s'+str(outdir)
 
-rotatval = deirot['ROTATVAL']
-rotatval.monitor()
+    # OVERRIDES output directory for testing purposes.
 
-# Monitor the FCS output directory
+#    output_dir = '/home/calvarez/Work/scripts/deimos/test_data'
 
-outdir = deifcs['OUTDIR']
-outdir.monitor()
+    os.chdir(output_dir)
 
-output_dir = '/s'+str(outdir)
-output_dir = '/home/calvarez/Work/scripts/deimos/test_data'
+    #---------------------------------------#
+    # Construct the FCS reference file name #
+    #---------------------------------------#
 
-os.chdir(output_dir)
+    refname = 'fcsref.' + gratenam + '.slider' + str(gratepos) + '.at.' + \
+              str(wavel) + '.' + dwfilnam + '.ref'
 
-# Construct the FCS reference file name
+    # If the FCS reference file already exists,
+    # rename the existing file by adding a random 
+    # number at the end of the file name.
+    
+    if os.path.isfile(refname):
+        suffix = str("%05d" % randint(00000,99999))
+        os.rename(refname, refname+'.'+suffix)
 
-refname = 'fcsref.' + gratenam + '.slider' + str(gratepos) + '.at.' +\
-          str(wavel) + '.' + dwfilnam + '.ref'
+    #--------------------------------------#
+    # Write the FCS reference file in disk #
+    #--------------------------------------#
 
-# Rename the file name if already exists
+    try:
+        f = open(refname, 'w')
+    except:
+        raise fcs_exceptions.AbortOnFcsWriteNotAllowed(refname, output_dir)
 
-if os.path.isfile(refname):
-    suffix = str("%05d" % randint(00000,99999))
-    os.rename(refname, refname+'.'+suffix)
+    f.write(refname + '\n')
+    f.write(gratenam + '\n')
+    f.write(str(gratepos) + '\n')
+    f.write(str(rotatval) + '\n')
+    f.write(str(wavel) + '\n')
+    f.write(str(dwfilnam) + '\n')
+    f.write(str(dwfocraw) + '\n')
+    f.write(flamps + '\n')
+    f.write(str(ttime) + '\n')
+    f.write(str(output_dir) + '\n')
+    f.write(outfile + '\n')
+    f.write(str(frameno) + '\n')
+    
+    f.close()
 
-#--------------------------------------#
-# Write the FCS reference file in disk #
-#--------------------------------------#
+    print('')
+    print('#############################################')
+    print('')
+    print('fcsref successful. Contents of snapshot file:')
 
-try:
-    f = open(refname, 'w')
-except:
-    raise FcsWriteNotAllowed(refname, output_dir)
+    f = open(refname, 'r')
+    print(f.read())
+    f.close()
 
-f.write(refname + '\n')
-f.write(gratenam + '\n')
-f.write(str(gratepos) + '\n')
-f.write(str(rotatval) + '\n')
-f.write(str(wavel) + '\n')
-f.write(str(output_dir) + '\n')
+    print('#############################################')
+    print('')
 
-f.close()
+    exit_code = 0
+    exit_message = "MSG %d: fcsref successful. Exiting fcsref." % (exit_code)
 
-print ('')
-print ('#############################################')
-print ('')
-print ('fcsref successful. Contents of snapshot file:')
+    fcs_auxiliary.fcsState.abort(exit_code, exit_message)
 
-f = open(refname, 'r')
-print (f.read())
-f.close()
 
-print ('#############################################')
-print ('')
+######################
+######################
+## Define functions ##
+######################
+######################
 
+
+def proceed(message):
+    """
+    Ask the user if she/he wants to proceed.
+    """
+
+    proceed = input(message)
+                
+    if ( len(proceed.strip()) == 0 ):
+        proceed = 'n'
+        
+    if ( proceed.lower() != 'y' ):
+        error_code = -550
+        error_message = "ERROR %d: fcsref terminated by user." % (error_code)
+        fcs_auxiliary.fcsState.interrupt(error_code, error_message)
+
+
+def check_rotator_pa(gpos, pa_flexure_center, pa_flexure_center_delta, pa):
+    """
+    Check if the rotator is at the correct PA angle 
+    for the slider center of flexure.
+    """
+
+    low_pa = pa_flexure_center - pa_flexure_center_delta
+    high_pa = pa_flexure_center + pa_flexure_center_delta
+
+    low_pa_360 = low_pa - 360.0
+    high_pa_360 = high_pa - 360.0
+
+    if pa_flexure_center == -999:
+        
+        question = str('FCS reference can be taken at any rotator angle for slider %d. Do you want to proceed (y/[n])?'% gratepos)
+        proceed(question)
+
+    elif ( ( pa > low_pa ) and ( pa < high_pa ) ) or ( ( pa > low_pa_360 ) and ( pa < high_pa_360 ) ):
+
+        question = str('DEIMOS rotator is already at PA %d, which is the slider %d center of flexure', (pa, gpos))
+        proceed(question)
+
+    else:    
+
+        fcs_auxiliary.AbortOnRotatorNotCenteredForFcsRef()
+
+
+##################
+##################
+## Main program ##
+##################
+##################
+
+if __name__ == '__main__':
+    
+    fcs_config = fcs_auxiliary.parseConfigFile()
+ 
+    while True:
+
+        try:
+            main(fcs_config)
+
+        except fcs_exceptions.FcsError as exception:
+            fcs_auxiliary.logMessage(exception.error_code, exception.error_message)
+                    
 sys.exit(0)
 

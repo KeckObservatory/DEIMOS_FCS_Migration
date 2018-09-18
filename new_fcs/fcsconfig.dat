@@ -1,5 +1,10 @@
 # Configuration file for FCS
 
+# FCS reference frames archive:
+
+FCSREF_ARCHIVE = /home/dmoseng/fcs_reference/
+YEARS_BACK = 3
+
 # Offline FCS CCD:
 #
 # 0 --> Both CCDs are on line
@@ -18,8 +23,13 @@ BLINK = 0
 # FCS detector configuration
 
 WINDOW = 1,0,400,1200,200
-BINNIG = 1,1
+BINNING = 1,1
 AUTOSHUT = 1
+
+# Lower and upper limits for the FCS integration time.
+
+FCS_MIN_EXPTIME = 1
+FCS_MAX_EXPTIME = 30
 
 # Focus tolerance (default FCSFOTO2 = 200 on 2018-02-01)
 
@@ -60,13 +70,30 @@ SLIDER4_FLEXURE_CENTER_DELTA = 5.0
 
 # Tent mirror central position.
 
-TENT_MIRROR_CENTER = -45
-TENT_MIRROR_CENTER_DELTA = 1
+TENT_MIRROR_CENTER = 45.0
+TENT_MIRROR_CENTER_DELTA = 0.1
+
+# Tent mirror limits.
+
+TENT_MIRROR_LLIM = 10
+TENT_MIRROR_ULIM = 9400
+TENT_MIRROR_BUFF = 490
 
 # Dewar translation stage central position.
 
 DEWAR_TRANSLATION_STAGE_CENTER = -750
-DEWAR TRANSLATION_STAGE_CENTER_DELTA = 5
+DEWAR_TRANSLATION_STAGE_CENTER_DELTA = 5
+
+# Dewar translation stage limits.
+
+DEWAR_TRANSLATION_STAGE_LLIM = -2300
+DEWAR_TRANSLATION_STAGE_ULIM = 800
+DEWAR_TRANSLATION_STAGE_BUFF = 100 
+
+# Grating tilt offset limits.
+
+GRATING_TILT_LLIM = -100
+GRATING_TILT_ULIM = 100
 
 # Central wavelength accuracy (number of 
 # significant digits):
@@ -78,11 +105,6 @@ CENTRAL_WAVELENGTH_ACCURACY = 1
 # CENTRAL_WAVELENGTH -/+ CENTRAL_WAVELENGTH_DELTA:
 
 CENTRAL_WAVELENGTH_DELTA = 0.2
-
-# Lower and upper limits for the FCS integration time.
-
-FCS_MIN_EXPTIME = 1
-FCS_MAX_EXPTIME = 30
 
 # Valid grating names:
 

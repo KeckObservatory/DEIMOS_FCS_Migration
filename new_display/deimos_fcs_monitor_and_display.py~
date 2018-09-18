@@ -1,0 +1,212 @@
+#! /kroot/rel/default/bin/kpython3
+
+"""
+Name: 
+	deimos_fcs_monitor_and_display
+
+Purpose:
+	Monitor the current data directory for the last DEIMOS science image 
+        and dis[play it in the DS9 client.
+
+Syntax:
+	deimos_ccd_monitor_and_display [ds9-name]
+
+Parameters:
+	ds9-name: the name of the ds9 display to connect to 
+		[default="deimos_fcs_autodisplay"]
+
+Logging:
+
+
+Modification history:
+
+       2018-Jul-13      CAAI     Original version based on the script
+                                 script mosfireMonitorAndDisplay.py 
+                                 by NPK.
+"""
+
+
+#-----------------------#
+# Import Python modules #
+#-----------------------#
+
+import sys, os
+import ktl
+import logging as lg
+import numpy as np
+from astropy.io import fits
+import inspect
+import shlex
+import subprocess
+import time
+import ds9_fcs
+
+#------------------#
+# Define constants #
+#------------------#
+
+ZOOM_INI = 'to fit'
+SCALE_MODE_INI = 'zscale'
+REGIONS_SHAPE_INI = 'projection'
+
+
+#-------------------#
+# configure logging #
+#-------------------#
+
+# extract the program name (minus extension) from argv[0]
+head, tail = os.path.split(sys.argv[0])
+prog_name, ext = os.path.splitext(tail)
+
+logfile = os.environ['HOME'] + '/' + prog_name + '.log'
+lg.basicConfig( filename=logfile, \
+                level=lg.DEBUG, \
+                format='%(asctime)s %(process)6d %(levelname)-8s %(filename)s %(lineno)d: %(message)s', \
+                datefmt='%Y-%m-%dT%H:%M:%S')
+
+# define a Handler which writes INFO messages or higher to the sys.stderr
+console = lg.StreamHandler()
+console.setLevel(lg.INFO)
+
+# set a format which is simpler for console use
+formatter = lg.Formatter('%(asctime)s %(levelname)s %(filename)s %(lineno)d: %(message)s')
+
+# tell the handler to use this format
+console.setFormatter(formatter)
+
+# add the handler to the root logger
+lg.getLogger('').addHandler(console)
+lg.info( '---------- Starting up ----------')
+
+#--------------------#
+# Cache KTL keywords #
+#--------------------#
+
+outdir = ktl.cache('deifcs', 'OUTDIR')
+outfile = ktl.cache('deifcs', 'OUTFILE')
+frameno = ktl.cache('deifcs', 'FRAMENO')
+
+def path_to_last_file():
+   """
+   Return the full disk name of the last file written
+   """
+   
+   try:
+
+      last_file_path = str('/s%s/%s%04d.fits' % (outdir.read(), outfile.read(), int(frameno.read())-1))
+      if ( os.path.exists(last_file_path) == True ):
+         last_file = last_file_path
+      else: 
+         lg.error("Last DEIMOS FCS file %s not found." % last_file_path)
+         last_file = None
+
+   except:           
+
+      lg.error("deifcs keyword service is unreachable.")
+      last_file = None
+
+   return last_file
+
+def path_to_previous_file():
+   """ 
+   Return the path of file to subtract from current file.
+   """
+
+   try:
+
+      previous_file_path = str('/s%s/%s%04d.fits' % (outdir.read(), outfile.read(), int(frameno.read())-2))
+      if ( os.path.exists(previous_file_path) == True ):
+         previous_file = previous_file_path
+      else: 
+         lg.error("Previous DEIMOS CCD file %s not found." % previous_file_path)
+         previous_file = None
+
+   except:           
+
+      lg.error("deifcs keyword service is unreachable.")
+      previous_file = None
+
+   return previous_file
+
+def wait_for_next_image(ds9_disp, last_file):
+   """
+   Iterate until the current frame changes, then return.
+   The name of the new file will be stored in params["current_file"].
+   """
+
+   lg.info("State %s" % (inspect.stack()[0][3]))
+
+   # loop until change in new image name...
+   
+   current_file = last_file
+   while ( last_file == current_file ):	
+      lg.debug("Waiting for new image")
+      time.sleep(1)
+      current_zoom = ds9_disp.xpaget('zoom')
+      current_file = path_to_last_file()
+      print('cz=', current_zoom)
+
+   # get the lastfile..
+   lg.info("New image %s has arrived" % current_file)
+
+
+def display_current_file(init, ds9_disp):
+   """ 
+   Ask ds9 to display current file. 
+   """
+
+   lg.info("State %s" % (inspect.stack()[0][3]))
+
+   current_file = path_to_last_file()
+   previous_file = path_to_previous_file()
+
+   if ( current_file is None ) and ( previous_file is None ) :
+      there_is_file = 0
+   else:
+      if ( init == 0 ):
+         ds9_disp.open(current_file, 1)
+      if ( init == 1 ):
+         ds9_disp.open(current_file, 1)   
+         ds9_disp.xpaset('zoom '+ZOOM_INI)
+         ds9_disp.xpaset('scale mode '+SCALE_MODE_INI)
+         ds9_disp.xpaset('regions shape '+REGIONS_SHAPE_INI)
+      there_is_file = 1
+   
+   return there_is_file, current_file
+
+
+def startup():
+   """
+   Initialize DS9 display frame.
+   """
+
+   lg.info("State %s" % (inspect.stack()[0][3]))
+   
+   if len(sys.argv) == 2:
+      disp_name = sys.argv[1]
+   else:
+      disp_name = "deimos_ccd_autodisplay"
+      
+   ds9_disp = ds9_fcs.ds9(disp_name)
+
+   return ds9_disp,disp_name
+
+
+#-----------#
+# Main Loop #
+#-----------#
+
+ds9_display, display_name = startup()
+initialize = 1
+file_exists, current_image = display_current_file(initialize, ds9_display)
+initialize = 0
+
+while True:
+
+   # Loop for next image
+   wait_for_next_image(ds9_display, current_image)
+   time.sleep(1)
+
+   # Display current file 
+   file_exists, current_image = display_current_file(initialize, ds9_display)
+

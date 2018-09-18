@@ -1,268 +1,329 @@
-import os
-import sys
+#! /kroot/rel/default/bin/kpython3
+
+"""
+fcszero -- Rotate DEIMOS to a PA that corresponds to the center of
+           the flexure range for the currently selected slider.
+
+Purpose: 
+
+Rotate DEIMOS to a PA that corresponds to the center of the
+flexure range for the currently selected slider.  If invoked with no
+arguments or with the 'new' argument, it will also reset the tent mirror,
+dewar X translation stage, and any applicable tilt offsets to the center
+of their respective ranges.  If invoked with the 'match' argument, only
+the PA will be adjusted.
+
+Usage:
+
+fcszero [ new | match ]
+
+Arguments:
+
+new:   Configure DEIMOS to take a new reference frame.
+match: Configure DEIMOS to take a matching reference frame.
+
+Output:
+
+None
+
+Restrictions:
+
+None
+
+"""
+
+###########################
+###########################
+## Import Python modules ##
+###########################
+###########################
+
+import sys, os
 import ktl
+from random import randint
+import numpy as np
+import fcs_exceptions
+import fcs_auxiliary
 
 
-def abort(message, fcserr):
-    """
-    Prints error message and code then quits with exit status of 1
+#######################
+#######################
+## Main control loop ##
+#######################
+#######################
 
-    Arguments:
-        message -- the error message to print
-        fcserr -- the error code to print
-    """
+def main(config):
 
-    print('fcszero aborting')
-    print('%s. Fcserr is %d' % (message, fcserr))
-    os.sys.exit(1)
+    # -----------------------------#
+    # Parse command line arguments #
+    # -----------------------------#
 
+    if len(sys.argv) == 1:
+        mode = 'new'
+    elif sys.argv[1] == 'new':
+        mode = 'new'
+    elif sys.argv[1] == 'match':
+        mode = 'match'
+    else:
+        raise fcs_exceptions.AbortOnWrongInputParameters()
 
-def check_keyword(service, keyword, message, fcserr):
-    """
-    Returns a keyword value if valid otherwise print errors and quit
+    message = str('Starting fcszero in mode %s' % mode)
+    fcs_auxiliary.logMEssage(message)
 
-    Arguments:
-        service -- KTL service name
-        keyword -- KTL keyword name
-        message -- the error message to print
-        fcserr -- the error code to print
-    """
+    # ------------------------#
+    # Check state of FCSSTATE #
+    # ------------------------#
 
+    fcsstate = ktl.cache('deifcs', 'FCSSTATE')
     try:
-        value = ktl.cache(service, keyword).read()
-        return value
-    except:
-        print('fcszero aborting')
-        print('%s. Fcserr is %d' % (message, fcserr))
-        os.sys.exit(1)
+        fcsstate.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeifcsCommunicationFailure('FCSSTATE')
+    
+    if fcsstate != 'idle':
+        raise fcs_exceptions.AbortOnFcsStateNotIdle()
 
+    # ---------------------------#
+    # Determine Grating Position #
+    # ---------------------------#
 
-def modify_fcsmsg(note, error=0):
-    """Writes message and error to KTL keywords fcsmsg and fcserr
-
-    Arguments:
-        note -- message to write to fcsmsg
-
-    Keyword Arguments:
-        error -- error code to write to fcserr (default 0)
-    """
-
-    ktl.write('deifcs', 'fcsmsg', note)
-    ktl.write('deifcs', 'fcserr', error)
-
-
-def modify_keyword(service, keyword, value, message, fcserr):
-    """
-    Modifies keyword otherwise prints errors and exits
-
-    Arguments:
-        service -- KTL service name
-        keyword -- KTL keyword name
-        value -- value to write to keyword
-        message -- error message to print
-        fcserr -- error code to print
-    """
-
+    gratepos = ktl.cache('deimot', 'GRATEPOS')
     try:
-        ktl.write(service, keyword, value)
-    except:
-        print('fcs aborting')
-        print('%s %d' % (message, fcserr))
-        os.sys.exit(1)
+        gratepos.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeimotCommunicationFailure('GRATEPOS')
 
+    message = str('Slider %s is clamped in position' % gratepos)
+    fcs_auxiliary.logMessage(message)
+
+    message = ('FCS about to configure DEIMOS for %s reference image' % mode)
+    message_code = 0
+    fcs_auxiliary.logErrorMessage(message, message_code)
+
+    # ---------------------------#
+    # Determine PA from ROTATVAL #
+    # ----------------------------#
+
+    rotatval = ktl.cache('deirot', 'ROTATVAL')
+    try:
+        rotatval.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeirotCommunicationFailure('ROTATVAL')
+
+    pa = int(rotatval)
+
+    # -------------#
+    # Get ROTATLCK #
+    # -------------#
+
+    rotatlck = ktl.cache('deirot', 'ROTATLCK')
+    rotatlck.monitor()
+    if rotatlck != 'UNLOCKED':
+        raise fcs_exceptions.RotatorLocked('')
+        
+    # -------------------------------#
+    # Change the rotator mode to POS #
+    # -------------------------------#
+
+    rotatmod = ktl.cache('deirot', 'ROTATMOD')
+    try:
+        rotatmod.monitor()
+        rotatmod.write('pos')
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnSettingTheRotationMode()
+
+    # -----------------------------------#
+    # Rotate to PA based on GRATEPOS     #
+    # Re-center the slider if mode = new #
+    # -----------------------------------#
+
+    if gratepos == 2:
+        rotate_to_pa(gratepos, float(config['SLIDER2_FLEXURE_CENTER']), float(config['SLIDER2_FLEXURE_CENTER_DELTA']), pa, rotatlck)
+
+    elif gratepos == 3:
+        rotate_to_pa(gratepos, float(config['SLIDER3_FLEXURE_CENTER']), float(config['SLIDER3_FLEXURE_CENTER_DELTA']), pa, rotatlck)
+        if mode == 'new':
+            new_reference(gratepos)
+
+    elif gratepos == 4:
+        rotate_to_pa(gratepos, float(config['SLIDER4_FLEXURE_CENTER']), float(config['SLIDER4_FLEXURE_CENTER_DELTA']), pa, rotatlck)
+        if mode == 'new':
+            new_reference(gratepos)
+
+    else:
+        raise fcs_auxiliary.AbortOnNoSliderClampedDown()
+
+    # -----------------------------------------------#
+    # If this is a new reference, then recenter tent #
+    # mirror and dewar translation stage.            #
+    # -----------------------------------------------#
+
+    if mode == 'new':
+
+        #----------------------#
+        # Recenter tent mirror #
+        #----------------------#
+        
+        tmirrval = ktl.cache('deimot', 'TMIRRVAL')
+        try:
+            tmirrval.monitor()
+        except ktl.ktlError:
+            raise fcs_exceptions.DeimotCommunicationFailure('TMIRRVAL')
+
+        tmirr_cen_down = float(config['TENT_MIRROR_CENTER']) - float(config['TENT_MIRROR_CENTER_DELTA'])
+        tmirr_cen_up = float(config['TENT_MIRROR_CENTER']) + float(config['TENT_MIRROR_CENTER_DELTA'])
+
+        if ( tmirrval < tmirr_cen_down ) or ( tmirrval > tmirr_cen_up ):
+
+            message = str('DEIMOS tent mirror position of %i not centered in its range' % tmirrval)
+            fcs_auxiliary.logMessage(message)
+            message = 'Re-centering the tent mirror'
+            fcs_auxiliary.logMessage(message)
+
+            try:
+                tmirrval.write(config['TENT_MIRROR_CENTER'])
+            except:
+                raise fcs_exceptions.AbortOnRecenteringTentMirror()
+        else:
+
+            message = 'DEIMOS tent mirror position is already centered in its range'
+            fcs_auxiliary.logMessage(message)
+        
+        #----------------------------------#
+        # Recenter dewar translation stage #
+        #----------------------------------#
+
+        dwxl8raw = ktl.cache('deimot', 'DWXL8RAW')
+        try:
+            dwxl8raw.monitor()
+        except ktl.ktlError:
+            raise fcs_exceptions.DeimotCommunicationFailure('DWXL8RAW')
+
+        
+        dwxl8_cen_down = float(config['DEWAR_TRANSLATION_STAGE_CENTER']) - float(config['DEWAR_TRANSLATION_STAGE_CENTER_DELTA'])
+        dwxl8_cen_up = float(config['DEWAR_TRANSLATION_STAGE_CENTER']) + float(config['DEWAR_TRANSLATION_STAGE_CENTER_DELTA'])
+
+        if ( dwxl8raw < dwxl8_cen_down ) or ( dwxl8raw > dwxl8_cen_up ):
+
+            message = str('DEIMOS X translation stage value %i is not centered in its range' % dwxl8raw))
+            fcs_auxiliary.logMessage(message)
+            message = 'Re-centering the dewar translate stage'
+            fcs_auxiliary.logMessage(message)
+            
+            try:
+                dwxl8raw.write(config['DEWAR_TRANSLATION_STAGE_CENTER'])
+            except:
+                raise fcs_exceptions.AbortOnRecenteringDewarXTranslationStage()
+
+        else:
+
+            message = 'DEIMOS dewar translation stage is already centered in its range'
+            fcs_auxiliary.logMessage(message)
+
+    exit_code = 0
+    exit_message = "MSG %d: fcszero $s successful. You are now ready to take reference images" % (mode, exit_code)
+
+    fcs_auxiliary.fcsState.abort(exit_code, exit_message)
+
+
+######################
+######################
+## Define functions ##
+######################
+######################
 
 def new_reference(gpos):
     """
-    Re-centers the given grating position slider
-
-    Arguments:
-        gpos -- grating position
+    Recenter the grating tilt for sliders 3 and 4
     """
 
-    if gpos == 3:
-        gtltoff = 'g3tltoff'
-        fcserr_tilt = -210
-        fcserr_zero = -211
+    gr_tlt_off = 'G' + str(gpos) + 'TLTOFF'
+    
+    grtiltoff = ktl.cache('deimot', gr_tlt_off)
+    try:
+        grtltoff.monitor()
+    except ktl.ktlError:
+        raise fcs_exceptions.AbortOnDeimotCommunicationFailure(grtltoff)
+
+    if grtltoff != 0:
+        
+        message = str('Slider %d tilt offset %s is not centered in its range' % (gpos, gtltoff))
+        fcs_auxliary.logMessage(message)
+        message = str('About to recenter the slider %d tilt by setting offset = 0' % gpos)
+        fcs_auxliary.logMessage(message)
+
+        try:
+            grtltoff.write(0)
+        except:
+            raise fcs_exceptions.AbortOnCenteringSliderTiltOffset(gpos)
+
     else:
-        gtltoff = 'g4tltoff'
-        fcserr_tilt = -212
-        fcserr_zero = -213
-
-    tilt_offset = ktl.cache('deimot', gltltoff)
-    fcsmsg.write ('About to recenter...', wait=False)
-    # Do something to check the keyword value and print pretty messages
-
-    tilt_offset.write(0, wait=True)
-
-    main.error_code = -210
-    main.error_message = "Error reading ...."
-    grtltoff.read()
-
-    main.error_code = -211
-    main.error_message = "Something else...'
-    grtiltraw.read()
+        
+        message = str('Slider %d tilt is already centered in its range' % gpos)
+        fcs_auxliary.logMessage(message)
 
 
-
-    main.error_code = -2134
-    main.error_message = "ahmahgerd I can't write"
-    grtiltoff.write(0)
-
-    check_keyword('deimot', gtltoff, 'Error reading slider %i tilt offset' % gpos, fcserr_tilt)
-    print('DEIMOS slider 3 tilt offset %s if not centered in its range' % gtltoff)
-    modify_fcsmsg('About to re-center the slider %i tilt by setting offset = 0' % gpos)
-    modify_keyword('deimot', gtltoff, 0, 'Error zeroing slider %i tilt offset' % gpos, fcserr_zero)
-
-
-def rotate_to_pa(gpos, lowPa, highPa):
+def rotate_to_pa(gpos, pa_flexure_center, pa_flexure_center_delta, pa, rotlck):
     """
-    Rotates to required position angle (PA)
-
-    Arguments:
-        gpos -- name of grating position
-        lowPA -- lower PA angle
-        highPA -- upper RA angle
+    Rotate to required position angle for center of flexure
     """
-    if gpos == 2:
-	fcserr_rot = -207
-	rotpos = -5
-    else:
-	fcserr_rot = -209
-	rotpos = -30
 
-    if pa != lowPa and pa != highPa:
-        print('DEIMOS PA of %i is not centered on flexure curve for slider %i' % (pa, gpos))
+    low_pa = pa_flexure_center - pa_flexure_center_delta
+    high_pa = pa_flexure_center + pa_flexure_center_delta
 
-        if rotatlck[1] != "UNLOCKED":
-            if gpos == 2:
-                fcserr_rot = -206
-            else:
-                fcserr_rot = -208
-            modify_fcsmsg('Unable to rotate DEIMOS because rotator is locked', fcserr_rot)
-            abort('Unable to rotate DEIMOS because rotator is locked', fcserr_rot)
+    low_pa_360 = low_pa - 360.0
+    high_pa_360 = high_pa - 360.0
+
+    if pa_flexure_center == -999:
+        
+        message = str('Slider %d can be clamped at any rotation angle. Clamping at PA = %d', (gpos, pa))
+        fcs_auxliary.logMessage(message)
+
+    elif ( ( pa > low_pa ) and ( pa < high_pa ) ) or ( ( pa > low_pa_360 ) and ( pa < high_pa_360 ) ):
+
+        message = str('DEIMOS rotator is already at PA %d, which is the slider %d center of flexure', (pa, gpos))
+        fcs_auxliary.logMessage(message)
+
+    else:    
+
+        message = str('DEIMOS rotator PA of %d is not at the center of flexure for slider %d' % (pa, gpos))
+        fcs_auxiliary.logMessage(message)
+
+        if rotlck != 'UNLOCKED':
+
+            fcs_auxiliary.AbortBecauseRotatorIsLocked()
+
         else:
-            print('About tor rotate DEIMOS to PA %i, slider %i center of flexure' % (rotpos, gpos))
-            modify_fcsmsg('About tor rotate DEIMOS to PA %i, slider %i center of flexure' % (rotpos, gpos))
-            modify_keyword('deirot', 'rotatval', rotpos, 'Error rotating DEIMOS to PA %i' % rotpos, fcserr_rot)
-    else:
-        print('DEIMOS is already at PA %i, slider %i center of flexure', (rotpos, gpos))
 
-# ---------------------------------------------#
-# Parse command line arguments                 #
-# ---------------------------------------------#
+            message = str('About tor rotate DEIMOS to PA %d, slider %d center of flexure' % (pa, gpos))
+            fcs_auxiliary.logMessage(message)
 
-if len(sys.argv) == 1:
-    mode = 'new'
-elif sys.argv[1] == 'new':
-    mode = 'new'
-elif sys.argv[1] == 'match':
-    mode = 'match'
-else:
-    abort('Usage: python fcszero [new | match]', -400)
+            rotatval = ktl.cache('deirot', 'ROTATVAL')
 
-print('fcszero version 3.0 will operate with mode %s' % mode)
-
-# ---------------------------------------------#
-# Check state of FCSSTATE                      #
-# ---------------------------------------------#
-
-fcsstate = check_keyword('deifcs', 'fcsstate', 'Error reading FCSSTATE', -200)
-
-if fcsstate != 'idle':
-    abort("Can't configure for reference images because FCS is not idle", -220)
-
-# ---------------------------------------------#
-# Determine Grating Position                   #
-# ---------------------------------------------#
-
-gratepos = int(check_keyword('deimot', 'gratepos', 'Error reading GRATEPOS', -201))
-gratepos = ktl.cache('deimot', 'GRATEPOS')
-gratepos.monitor()
-
-print('Slider %s is clamped in position' % gratepos)
-modify_fcsmsg('FCS about to configure DEIMOS for %s reference image' % mode)
-# sleep?
-
-# ---------------------------------------------#
-# Determine PA from ROTATVAL                   #
-# ---------------------------------------------#
-
-pa = int(float(check_keyword('deirot', 'rotatval', 'Error reading position angle', -202)))
-
-# ---------------------------------------------#
-# Get ROTATLCK                                 #
-# ---------------------------------------------#
-
-rotatlck = check_keyword('deirot', 'rotatlck', 'Error reading ROTATLCK', -203)
-
-if rotatlck[1] != "UNLOCKED":
-    print('warning: DEIMOS rotation system is locked')
-    modify_fcsmsg('DEIMOS rotation system is locked', -204)
-
-# ---------------------------------------------#
-# Modify rotatmod = pos                        #
-# ---------------------------------------------#
-
-modify_keyword('deirot', 'rotatmod', 'pos', 'Error setting rotator to pos', -205)
-
-# ---------------------------------------------#
-# Rotate to PA based on GRATEPOS               #
-# Re-center the slider if mode = new           #
-# ---------------------------------------------#
-
-if gratepos == 2:
-    rotate_to_pa(gratepos, -5, -365)
-elif gratepos == 3 or gratepos == 4:
-    rotate_to_pa(gratepos, -30, -390)
-    if mode == 'new':
-        new_reference(gratepos)
-else:
-    modify_fcsmsg('No slider clamped in place, so FCS cannot be zeroed')
-    abort("FCS can't be zeroed because a slider is not clamped down'", -214)
-
-# ---------------------------------------------#
-# Re-center tent mirror                        #
-# Re-center dewar translation                  #
-# ---------------------------------------------#
-if mode == 'new':
-
-    tmirr = int(check_keyword('deimot', 'tmirrval' 'Error reading tent mirror position', -215))
-
-    if tmirr != 45:
-        print('DEIMOS tent mirror position of %i not centered in its range' % tmirr)
-        modify_fcsmsg('Re-centering the tent mirror')
-        modify_keyword('deimot', 'tmirrcal', 45.0, 'Error re-centering tent mirror', -216)
-    else:
-        print('DEIMOS tent mirror position is already centered in its range')
-
-    main.error_code = -217
-    dwx = int(check_keyword('deimot', 'dwx18raw', 'Error reading dewar X translation', -217))
-
-    if dwx < -755 or dwx > -745:
-        print('DEIMOS X translation stage value %i is not centered in its range' % dwx)
-        modify_fcsmsg('Re-centering the dewar translate stage')
-        main.error_code = -218
-        modify_keyword('deimot', 'dwx18raw', -750, 'Error re-centering dewar translation', -218)
-    else:
-        print('DEIMOS dewar translation stage is already centered in its range')
-
-print('fcszero %s successful. You are now ready to take reference spots' % mode)
-modify_fcsmsg('fcszero $s successful. You are now ready to take reference images' % mode)
+            try:
+                rotatval.write(pa_flexure_center)
+            except:
+                fcs_auxiliary.AbortOnErrorWhenRotatingDeimos(pa_flexure_center)
 
 
-def main():
-    foo bar barz
-
-main.error_code = 0
+##################
+##################
+## Main program ##
+##################
+##################
 
 if __name__ == '__main__':
-    try:
-        main()
-    except FcsException:
-        do the same handling as below
-    except:
-        modify fcserr(main.error_code)
-        # Convert the last line of the exception to text
-        modify fcsmsg to have the text of the exception
-        modify fcserr to have the appropriate error code (attached to the exception)
-        raise
+    
+    fcs_config = fcs_auxiliary.parseConfigFile()
+ 
+    while True:
+
+        try:
+            main(fcs_config)
+
+        except fcs_exceptions.FcsError as exception:
+            fcs_auxiliary.logMessage(exception.error_code, exception.error_message)
+                    
+sys.exit(0)
+
+
