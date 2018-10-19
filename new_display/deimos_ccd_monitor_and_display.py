@@ -104,15 +104,33 @@ lg.info( '---------- Starting up ----------')
 # Cache KTL keywords #
 #--------------------#
 
-outdir = ktl.cache('deiccd', 'OUTDIR')
-outfile = ktl.cache('deiccd', 'OUTFILE')
-frameno = ktl.cache('deiccd', 'FRAMENO')
-mosmode = ktl.cache('deiccd', 'MOSMODE')
-exposip = ktl.cache('deiccd', 'EXPOSIP')
+deiccd = ktl.cache('deiccd')
+
+outdir = deiccd['OUTDIR']
+outfile = deiccd['OUTFILE']
+frameno = deiccd['FRAMENO']
+mosmode = deiccd['MOSMODE']
+exposip = deiccd['EXPOSIP']
+
+keywords = [outdir, outfile, frameno, mosmode, exposip]
+for keyword in keywords:
+    keyword.monitor()
+
 
 #------------------#
 # Define functions #
 #------------------#
+
+def find_orientation():
+   """
+   Return x for direct imaging, and none for MOS
+   """
+    if exposip.binary == True:
+        if mosmode.ascii == 'Direct':
+            orient_val = 'x'
+        else:
+            orient_val = 'none'
+    return orient_val
 
 def path_to_file():
    """
@@ -121,28 +139,20 @@ def path_to_file():
    
    try:
 
-      file_path = str( '/s%s/%s%04d.fits' % (outdir.read(), outfile.read(), int(frameno.read())-1) )
-
-      if exposip.read() == True:
-         if mosmode.read() == 'Direct':
-            orient_val = 'x'
-         else:
-            orient_val = 'none'
+      file_path = str( '/s%s/%s%04d.fits' % (outdir.ascii, outfile.ascii, int(frameno.ascii)-1) )
 
       if os.path.exists(file_path) == True:
          current_file = file_path
       else: 
          lg.info("DEIMOS CCD file %s is not available yet." % file_path)
          current_file = None
-         orient_val = 'none'
 
    except:           
 
       lg.error("deifcs keyword service is unreachable.")
       current_file = None
-      orient_val = 'none'
 
-   return current_file, orient_val
+   return current_file
 
 
 def wait_for_image(ds9_disp, last_file):
@@ -159,28 +169,20 @@ def wait_for_image(ds9_disp, last_file):
    current_pan_mode = ds9_disp.xpaget('pan')
    current_scale_mode = ds9_disp.xpaget('scale mode')
    current_regions_shape = ds9_disp.xpaget('regions shape')
-   current_file, current_orient_value = path_to_file()
+   current_file = path_to_file()
 
-   while ( current_file == last_file ):	
-      lg.debug("Waiting for new image")
-      current_zoom = ds9_disp.xpaget('zoom')
-      current_pan_mode = ds9_disp.xpaget('pan')
-      current_scale_mode = ds9_disp.xpaget('scale mode')
-      current_regions_shape = ds9_disp.xpaget('regions shape')
-      current_file, current_orient_value = path_to_file()
+   current_frameno = frameno.ascii
+   new_exposure = '$deiccd.frameno != %s' % (current_frameno)
+   new_exposure = ktl.Expression(new_exposure)
 
-      if ( DEBUG_MODE == True ):
-         print('')
-         print(str(dt.datetime.now()))
-         print('Waiting for new image...')
-         print('current_zoom = ', current_zoom)
-         print('current_pan_mode = ', current_pan_mode)
-         print('current_orient_vaule = ', current_orient_value)
-         print('current_scale_mode = ', current_scale_mode)
-         print('current_regions_shape = ', current_regions_shape)
-         print('current_file = ', current_file)
-         
-      tm.sleep(SLEEP_TIME)
+   while True:
+       result = new_exposure.wait(timeout=5)
+       if result == True:
+           current_frameno = frameno.ascii
+           break
+
+   current_file = path_to_file()
+   current_orient_value = find_orientation()
 
    # get the lastfile..
    lg.info("New image %s has arrived" % current_file)
